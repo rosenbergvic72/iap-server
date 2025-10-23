@@ -55,6 +55,21 @@ if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
   }
 }
 
+try {
+  let raw = process.env.SERVICE_ACCOUNT_JSON || null;
+  if (!raw && process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    raw = fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, 'utf8');
+  }
+  if (raw) {
+    const sa = JSON.parse(raw);
+    console.log('[IAP] Using service account:', sa.client_email, 'project_id:', sa.project_id);
+  } else {
+    console.warn('[IAP] Service account JSON not found (no SERVICE_ACCOUNT_JSON and no GOOGLE_APPLICATION_CREDENTIALS file)');
+  }
+} catch (e) {
+  console.error('[IAP] Could not read/parse service-account JSON for log:', e.message);
+}
+
 // ---------- Helpers ----------
 function maskToken(t, keep = 6) {
   if (!t || typeof t !== 'string') return '';
