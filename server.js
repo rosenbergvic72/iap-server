@@ -5,12 +5,14 @@
 // - Verify purchase:  POST /iap/google/subscription/verify
 //
 // Env vars you may want to set on the host (Render -> Settings -> Environment):
-//   PORT                         (Render provides automatically)
-//   PACKAGE_NAME                 e.g. com.rosenbergvictor72.pealim2
-//   SERVICE_ACCOUNT_JSON         (paste the raw JSON key content here)  OR
-//   GOOGLE_APPLICATION_CREDENTIALS (path to service-account.json in container)
-//   API_KEY                      (optional; if set, client must send x-api-key header)
-//   ALLOWED_ORIGIN               (optional; CORS allow-origin; default "*")
+//   PORT
+//   PACKAGE_NAME                      e.g. com.rosenbergvictor72.pealim2
+//   SERVICE_ACCOUNT_JSON              (paste raw JSON key)  OR
+//   GOOGLE_APPLICATION_CREDENTIALS    (path to service-account.json)
+//   API_KEY                           (optional; if set, client must send x-api-key)
+//   ALLOWED_ORIGIN                    (optional; CORS allow-origin; default "*")
+//   ACK_ON_VERIFY                     (optional; "1" to auto-ack active subs on verify)
+//   ACK_ONLY_IF_ACTIVE                (optional; default "1"; if "0", ack when not active too)
 //
 // Client should POST JSON:
 //   { userId, productId, packageName, purchaseToken }
@@ -18,7 +20,7 @@
 // Notes:
 // - Tries SubscriptionsV2 first (no productId needed), then falls back to v1 (needs productId).
 // - Masks purchaseToken in logs.
-// - Acknowledgement is done on-device via RN-IAP; server only verifies.
+// - Can optionally acknowledge on server (recommended) if ACK_ON_VERIFY=1.
 //
 // Run locally:
 //   set GOOGLE_APPLICATION_CREDENTIALS=.\service-account.json
@@ -38,6 +40,9 @@ const PACKAGE_NAME = process.env.PACKAGE_NAME || '';
 const API_KEY = process.env.API_KEY || '';                 // if set, require x-api-key
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';   // CORS allow-origin; "" -> "*"
 const ENABLE_CORS = true;
+
+const ACK_ON_VERIFY = String(process.env.ACK_ON_VERIFY || '0') === '1';
+const ACK_ONLY_IF_ACTIVE = String(process.env.ACK_ONLY_IF_ACTIVE || '1') === '1';
 
 // If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
 // materialize a local file so GoogleAuth can read it.
@@ -112,9 +117,6 @@ function normalizeV2(resp) {
     : [];
   const expiresAtISO = pickMaxExpiryISO(expiries);
 
-  // renewalState may exist (string). If missing, leave undefined.
-  // Possible values (docs evolve): RENEWAL_STATE_REVOKED/CANCELED/RENEWED/PENDING etc.
-  // We'll infer willRenew conservatively if renewalState hints "RENEWED" or similar.
   const renewalState = d.renewalState || '';
   const willRenew =
     renewalState &&
@@ -123,13 +125,16 @@ function normalizeV2(resp) {
       ? true
       : undefined;
 
+  // acknowledgementState in v2: string like ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED / _PENDING
+  const ackState = d.acknowledgementState || '';
+
   return {
     source: 'v2',
     active: activeStates.has(state),
     willRenew,
     expiresAtISO,
     subscriptionState: state,
-    acknowledgementState: d.acknowledgementState || undefined,
+    acknowledgementState: ackState || undefined,
     orderId: d.latestOrderId || undefined,
     regionCode: d.regionCode || undefined,
   };
@@ -142,8 +147,7 @@ function normalizeV1(resp) {
   const expiresAtISO = msToIso(expiryMs);
   const nowActive = Number.isFinite(expiryMs) && expiryMs > Date.now();
 
-  // willRenew = autoRenewing && not user-canceled (cancelReason=0 or null)
-  // cancelReason: 0 = user canceled, 1 = system canceled, 2 = replaced by new sub, 3 = developer canceled
+  // willRenew = autoRenewing && not user-canceled (cancelReason=0/1/3)
   let willRenew = undefined;
   if (typeof d.autoRenewing === 'boolean') {
     const canceled = d.cancelReason === 0 || d.cancelReason === 1 || d.cancelReason === 3;
@@ -158,7 +162,7 @@ function normalizeV1(resp) {
     paymentState: d.paymentState,
     cancelReason: d.cancelReason,
     orderId: d.orderId,
-    acknowledgementState: d.acknowledgementState,
+    acknowledgementState: d.acknowledgementState, // 0/1
     priceCurrencyCode: d.priceCurrencyCode,
     priceAmountMicros: d.priceAmountMicros,
   };
@@ -173,6 +177,43 @@ async function getAndroidPublisher() {
   const authClient = await auth.getClient();
   publisherClient = google.androidpublisher({ version: 'v3', auth: authClient });
   return publisherClient;
+}
+
+// Acknowledge helper (v1 endpoint; works even if we read v2).
+async function acknowledgeIfNeeded(publisher, {
+  packageName, productId, purchaseToken,
+  normalized, force = false,
+}) {
+  // Need productId for v1 acknowledge; bail if missing
+  if (!productId) {
+    return { tried: false, ok: false, reason: 'no-productId' };
+  }
+
+  // Skip if already acknowledged
+  const ackStr = String(normalized.acknowledgementState || '');
+  const isAcked =
+    /ACKNOWLEDGED/i.test(ackStr) || ackStr === '1' || ackStr === 1;
+
+  if (isAcked) {
+    return { tried: false, ok: true, reason: 'already-acknowledged' };
+  }
+
+  // If only-when-active requested, but sub not active — skip
+  if (!force && ACK_ONLY_IF_ACTIVE && !normalized.active) {
+    return { tried: false, ok: false, reason: 'not-active' };
+  }
+
+  try {
+    await publisher.purchases.subscriptions.acknowledge({
+      packageName,
+      subscriptionId: productId,
+      token: purchaseToken,
+      requestBody: { developerPayload: 'ack-by-server' },
+    });
+    return { tried: true, ok: true };
+  } catch (e) {
+    return { tried: true, ok: false, error: e?.message || String(e) };
+  }
 }
 
 // ---------- App ----------
@@ -198,7 +239,8 @@ app.get('/', (req, res) => {
     service: 'google-play-iap-verifier',
     package: PACKAGE_NAME || null,
     cors: ALLOWED_ORIGIN || '*',
-    v: '1.0.0',
+    ackOnVerify: ACK_ON_VERIFY,
+    v: '1.1.0',
   });
 });
 
@@ -255,6 +297,25 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       normalized = normalizeV1(v1);
     }
 
+    let ack = { tried: false, ok: false, reason: 'disabled' };
+    if (ACK_ON_VERIFY) {
+      ack = await acknowledgeIfNeeded(publisher, {
+        packageName: pkg,
+        productId,
+        purchaseToken,
+        normalized,
+        force: !ACK_ONLY_IF_ACTIVE,
+      });
+      if (ack.tried) {
+        console.log('[IAP] acknowledge attempt:', {
+          tokenMasked: maskToken(purchaseToken),
+          ok: ack.ok,
+          reason: ack.reason || null,
+          error: ack.error || null,
+        });
+      }
+    }
+
     console.log('[IAP] verify ok:', {
       userId: userId || null,
       productId: productId || null,
@@ -264,6 +325,10 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       pro: !!normalized.active,
       willRenew: normalized.willRenew,
       expiresAt: normalized.expiresAtISO || null,
+      ackState: normalized.acknowledgementState || null,
+      ackOnVerify: ACK_ON_VERIFY,
+      ackTried: ack.tried,
+      ackOk: ack.ok,
     });
 
     res.json({
@@ -272,14 +337,17 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       userId: userId || null,
       productId: productId || null,
       pro: !!normalized.active,
+      ack: { tried: ack.tried, ok: ack.ok, reason: ack.reason || null },
       ...normalized,
+      usedVersion: used,
     });
   } catch (err) {
     const code = err?.response?.status || 500;
     console.error('[IAP] verify error:', {
       status: code,
       message: err?.message,
-      google: err?.response?.data ? true : false,
+      google: !!err?.response?.data,
+      data: err?.response?.data || null,
     });
     res.status(code).json({
       ok: false,
@@ -295,4 +363,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('      Key:', process.env.GOOGLE_APPLICATION_CREDENTIALS || '(via SERVICE_ACCOUNT_JSON or not set)');
   if (API_KEY) console.log('      API key required: yes');
   if (ALLOWED_ORIGIN) console.log('      CORS origin:', ALLOWED_ORIGIN);
+  console.log('      ACK_ON_VERIFY:', ACK_ON_VERIFY);
+  console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
 });
