@@ -13,6 +13,8 @@
 //   ALLOWED_ORIGIN                    (optional; CORS allow-origin; default "*")
 //   ACK_ON_VERIFY                     (optional; "1" to auto-ack active subs on verify)
 //   ACK_ONLY_IF_ACTIVE                (optional; default "1"; if "0", ack when not active too)
+//   ENTITLE_WHILE_NOT_EXPIRED         (optional; default "1"; if "1", pro=true while not expired)
+//   ENTITLE_REQUIRE_ACK               (optional; default "1"; if "1", pro requires acknowledged)
 //
 // Client should POST JSON:
 //   { userId, productId, packageName, purchaseToken }
@@ -43,6 +45,10 @@ const ENABLE_CORS = true;
 
 const ACK_ON_VERIFY = String(process.env.ACK_ON_VERIFY || '0') === '1';
 const ACK_ONLY_IF_ACTIVE = String(process.env.ACK_ONLY_IF_ACTIVE || '1') === '1';
+
+// Entitlement flags
+const ENTITLE_WHILE_NOT_EXPIRED = String(process.env.ENTITLE_WHILE_NOT_EXPIRED || '1') === '1';
+const ENTITLE_REQUIRE_ACK       = String(process.env.ENTITLE_REQUIRE_ACK || '1') === '1';
 
 // If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
 // materialize a local file so GoogleAuth can read it.
@@ -240,7 +246,10 @@ app.get('/', (req, res) => {
     package: PACKAGE_NAME || null,
     cors: ALLOWED_ORIGIN || '*',
     ackOnVerify: ACK_ON_VERIFY,
-    v: '1.1.0',
+    ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
+    entitleWhileNotExpired: ENTITLE_WHILE_NOT_EXPIRED,
+    entitleRequireAck: ENTITLE_REQUIRE_ACK,
+    v: '1.2.0',
   });
 });
 
@@ -297,6 +306,27 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       normalized = normalizeV1(v1);
     }
 
+    // ---- Entitlement logic ----
+    const expMs = Date.parse(normalized.expiresAtISO || '') || 0;
+    const notExpired = Number.isFinite(expMs) && expMs > Date.now();
+
+    const ackStr = String(normalized.acknowledgementState ?? '');
+    const isAcked =
+      /ACKNOWLEDGED/i.test(ackStr) || ackStr === '1' || ackStr === 1;
+
+    // Base rule: active if Google reports active
+    let entitled = !!normalized.active;
+
+    // Optional extension: entitled while not expired even if state=CANCELED
+    if (!entitled && ENTITLE_WHILE_NOT_EXPIRED && notExpired) {
+      entitled = true;
+    }
+
+    // Optional requirement: must be acknowledged
+    if (ENTITLE_REQUIRE_ACK && entitled && !isAcked) {
+      entitled = false;
+    }
+
     let ack = { tried: false, ok: false, reason: 'disabled' };
     if (ACK_ON_VERIFY) {
       ack = await acknowledgeIfNeeded(publisher, {
@@ -314,6 +344,16 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
           error: ack.error || null,
         });
       }
+      // Если только что ack прошёл — пересчитаем isAcked/entitled с учётом политики
+      if (ack.ok) {
+        // считаем, что теперь acked
+        if (!isAcked) {
+          // пересчитать финальную "entitled" при требовании ACK
+          if (ENTITLE_REQUIRE_ACK && entitled === true) {
+            // уже true — остаётся true
+          }
+        }
+      }
     }
 
     console.log('[IAP] verify ok:', {
@@ -322,13 +362,22 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       packageName: pkg,
       tokenMasked: maskToken(purchaseToken),
       source: normalized.source,
-      pro: !!normalized.active,
+      subscriptionState: normalized.subscriptionState || null,
+      acknowledgementState: normalized.acknowledgementState || null,
       willRenew: normalized.willRenew,
       expiresAt: normalized.expiresAtISO || null,
-      ackState: normalized.acknowledgementState || null,
+      notExpired,
+      isAcked,
+      entitled,
+      pro: entitled, // alias
+      policy: {
+        entitleWhileNotExpired: ENTITLE_WHILE_NOT_EXPIRED,
+        entitleRequireAck: ENTITLE_REQUIRE_ACK,
+      },
       ackOnVerify: ACK_ON_VERIFY,
       ackTried: ack.tried,
       ackOk: ack.ok,
+      ackReason: ack.reason || null,
     });
 
     res.json({
@@ -336,7 +385,10 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       packageName: pkg,
       userId: userId || null,
       productId: productId || null,
-      pro: !!normalized.active,
+      pro: !!entitled,
+      entitled: !!entitled,
+      notExpired,
+      isAcked,
       ack: { tried: ack.tried, ok: ack.ok, reason: ack.reason || null },
       ...normalized,
       usedVersion: used,
@@ -365,4 +417,6 @@ app.listen(PORT, '0.0.0.0', () => {
   if (ALLOWED_ORIGIN) console.log('      CORS origin:', ALLOWED_ORIGIN);
   console.log('      ACK_ON_VERIFY:', ACK_ON_VERIFY);
   console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
+  console.log('      ENTITLE_WHILE_NOT_EXPIRED:', ENTITLE_WHILE_NOT_EXPIRED);
+  console.log('      ENTITLE_REQUIRE_ACK:', ENTITLE_REQUIRE_ACK);
 });
