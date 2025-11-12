@@ -50,6 +50,10 @@ const ACK_ONLY_IF_ACTIVE = String(process.env.ACK_ONLY_IF_ACTIVE || '1') === '1'
 const ENTITLE_WHILE_NOT_EXPIRED = String(process.env.ENTITLE_WHILE_NOT_EXPIRED || '1') === '1';
 const ENTITLE_REQUIRE_ACK       = String(process.env.ENTITLE_REQUIRE_ACK || '1') === '1';
 
+// Post-ACK refresh behavior
+const ACK_REFRESH_RETRIES   = Number(process.env.ACK_REFRESH_RETRIES || 2);
+const ACK_REFRESH_DELAY_MS  = Number(process.env.ACK_REFRESH_DELAY_MS || 1200);
+
 // If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
 // materialize a local file so GoogleAuth can read it.
 if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -106,18 +110,22 @@ function pickMaxExpiryISO(expiries = []) {
   return new Date(Math.max(...ms)).toISOString();
 }
 
+const ACTIVE_STATES_V2 = new Set([
+  'SUBSCRIPTION_STATE_ACTIVE',
+  'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
+  'SUBSCRIPTION_STATE_ON_HOLD',
+  'SUBSCRIPTION_STATE_PAUSED',
+]);
+
+function isAckedValue(val) {
+  const s = String(val ?? '');
+  return /ACKNOWLEDGED/i.test(s) || s === '1';
+}
+
 // Normalize SubscriptionsV2 response
 function normalizeV2(resp) {
   const d = resp?.data || {};
-  const state = d.subscriptionState || ''; // e.g. SUBSCRIPTION_STATE_ACTIVE / CANCELED / IN_GRACE_PERIOD / ON_HOLD
-  const activeStates = new Set([
-    'SUBSCRIPTION_STATE_ACTIVE',
-    'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
-    'SUBSCRIPTION_STATE_ON_HOLD',
-    'SUBSCRIPTION_STATE_PAUSED', // just in case
-  ]);
-
-  // expiryTime appears per lineItem (RFC3339). Pick max.
+  const state = d.subscriptionState || '';
   const expiries = Array.isArray(d.lineItems)
     ? d.lineItems.map((li) => li?.expiryTime).filter(Boolean)
     : [];
@@ -131,12 +139,11 @@ function normalizeV2(resp) {
       ? true
       : undefined;
 
-  // acknowledgementState in v2: string like ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED / _PENDING
   const ackState = d.acknowledgementState || '';
 
   return {
     source: 'v2',
-    active: activeStates.has(state),
+    active: ACTIVE_STATES_V2.has(state),
     willRenew,
     expiresAtISO,
     subscriptionState: state,
@@ -153,7 +160,6 @@ function normalizeV1(resp) {
   const expiresAtISO = msToIso(expiryMs);
   const nowActive = Number.isFinite(expiryMs) && expiryMs > Date.now();
 
-  // willRenew = autoRenewing && not user-canceled (cancelReason=0/1/3)
   let willRenew = undefined;
   if (typeof d.autoRenewing === 'boolean') {
     const canceled = d.cancelReason === 0 || d.cancelReason === 1 || d.cancelReason === 3;
@@ -185,6 +191,10 @@ async function getAndroidPublisher() {
   return publisherClient;
 }
 
+async function sleep(ms) {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
 // Acknowledge helper (v1 endpoint; works even if we read v2).
 async function acknowledgeIfNeeded(publisher, {
   packageName, productId, purchaseToken,
@@ -195,12 +205,13 @@ async function acknowledgeIfNeeded(publisher, {
     return { tried: false, ok: false, reason: 'no-productId' };
   }
 
-  // Skip if already acknowledged
-  const ackStr = String(normalized.acknowledgementState || '');
-  const isAcked =
-    /ACKNOWLEDGED/i.test(ackStr) || ackStr === '1' || ackStr === 1;
+  // Skip if package mismatch (защита от "чужих" токенов)
+  if (PACKAGE_NAME && packageName && PACKAGE_NAME !== packageName) {
+    return { tried: false, ok: false, reason: 'wrong-package' };
+  }
 
-  if (isAcked) {
+  // Skip if already acknowledged
+  if (isAckedValue(normalized.acknowledgementState)) {
     return { tried: false, ok: true, reason: 'already-acknowledged' };
   }
 
@@ -218,7 +229,12 @@ async function acknowledgeIfNeeded(publisher, {
     });
     return { tried: true, ok: true };
   } catch (e) {
-    return { tried: true, ok: false, error: e?.message || String(e) };
+    const msg = e?.message || String(e);
+    // не ретраим заведомо «чужую» покупку
+    if (/not owned by the user/i.test(msg)) {
+      return { tried: true, ok: false, reason: 'not-owned', error: null };
+    }
+    return { tried: true, ok: false, error: msg };
   }
 }
 
@@ -249,7 +265,9 @@ app.get('/', (req, res) => {
     ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
     entitleWhileNotExpired: ENTITLE_WHILE_NOT_EXPIRED,
     entitleRequireAck: ENTITLE_REQUIRE_ACK,
-    v: '1.2.0',
+    ackRefreshRetries: ACK_REFRESH_RETRIES,
+    ackRefreshDelayMs: ACK_REFRESH_DELAY_MS,
+    v: '1.3.0',
   });
 });
 
@@ -310,9 +328,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     const expMs = Date.parse(normalized.expiresAtISO || '') || 0;
     const notExpired = Number.isFinite(expMs) && expMs > Date.now();
 
-    const ackStr = String(normalized.acknowledgementState ?? '');
-    const isAcked =
-      /ACKNOWLEDGED/i.test(ackStr) || ackStr === '1' || ackStr === 1;
+    let isAcked = isAckedValue(normalized.acknowledgementState);
 
     // Base rule: active if Google reports active
     let entitled = !!normalized.active;
@@ -327,6 +343,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       entitled = false;
     }
 
+    // ---- ACK (server side) ----
     let ack = { tried: false, ok: false, reason: 'disabled' };
     if (ACK_ON_VERIFY) {
       ack = await acknowledgeIfNeeded(publisher, {
@@ -336,6 +353,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
         normalized,
         force: !ACK_ONLY_IF_ACTIVE,
       });
+
       if (ack.tried) {
         console.log('[IAP] acknowledge attempt:', {
           tokenMasked: maskToken(purchaseToken),
@@ -344,14 +362,39 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
           error: ack.error || null,
         });
       }
-      // Если только что ack прошёл — пересчитаем isAcked/entitled с учётом политики
-      if (ack.ok) {
-        // считаем, что теперь acked
-        if (!isAcked) {
-          // пересчитать финальную "entitled" при требовании ACK
-          if (ENTITLE_REQUIRE_ACK && entitled === true) {
-            // уже true — остаётся true
-          }
+
+      // Если только что ack прошёл — дёрнем короткий re-fetch (V2 приоритетно)
+      if (ack.ok && !isAcked) {
+        for (let i = 0; i < ACK_REFRESH_RETRIES; i++) {
+          await sleep(ACK_REFRESH_DELAY_MS);
+          try {
+            let refreshed;
+            try {
+              const v2r = await publisher.purchases.subscriptionsv2.get({
+                packageName: pkg,
+                token: purchaseToken,
+              });
+              refreshed = normalizeV2(v2r);
+            } catch {
+              if (productId) {
+                const v1r = await publisher.purchases.subscriptions.get({
+                  packageName: pkg,
+                  subscriptionId: productId,
+                  token: purchaseToken,
+                });
+                refreshed = normalizeV1(v1r);
+              }
+            }
+            if (refreshed) {
+              normalized = refreshed;
+              isAcked = isAckedValue(refreshed.acknowledgementState);
+              // Переоценим entitlement после ACK
+              let ent2 = !!refreshed.active || (!!ENTITLE_WHILE_NOT_EXPIRED && notExpired);
+              if (ENTITLE_REQUIRE_ACK && ent2 && !isAcked) ent2 = false;
+              entitled = ent2;
+              if (isAcked) break;
+            }
+          } catch {}
         }
       }
     }
@@ -375,9 +418,11 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
         entitleRequireAck: ENTITLE_REQUIRE_ACK,
       },
       ackOnVerify: ACK_ON_VERIFY,
+      ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
       ackTried: ack.tried,
       ackOk: ack.ok,
       ackReason: ack.reason || null,
+      usedVersion: used,
     });
 
     res.json({
@@ -419,4 +464,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
   console.log('      ENTITLE_WHILE_NOT_EXPIRED:', ENTITLE_WHILE_NOT_EXPIRED);
   console.log('      ENTITLE_REQUIRE_ACK:', ENTITLE_REQUIRE_ACK);
+  console.log('      ACK_REFRESH_RETRIES:', ACK_REFRESH_RETRIES);
+  console.log('      ACK_REFRESH_DELAY_MS:', ACK_REFRESH_DELAY_MS);
 });
