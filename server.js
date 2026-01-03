@@ -283,6 +283,19 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     }
 
     const { userId, productId, packageName, purchaseToken } = req.body || {};
+
+    // ===== DEBUG INPUT FROM CLIENT =====
+    console.log('[IAP][VERIFY][INPUT]', {
+      userId: userId || null,
+      productId: productId || null,
+      packageName_from_client: packageName || null,
+      packageName_env: PACKAGE_NAME || null,
+      pkg_effective: (packageName || PACKAGE_NAME) || null,
+      purchaseToken_masked: purchaseToken ? maskToken(purchaseToken) : null,
+      tokenLength: purchaseToken?.length ?? 0,
+    });
+    // ==================================
+
     const pkg = packageName || PACKAGE_NAME;
 
     if (!purchaseToken) {
@@ -440,15 +453,30 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     });
   } catch (err) {
     const code = err?.response?.status || 500;
+    const data = err?.response?.data;
+
+    // ===== DEBUG GOOGLE ERROR (expanded) =====
+    console.error('[IAP][VERIFY][GOOGLE_ERROR]', {
+      status: code,
+      message: data?.error?.message || err?.message || null,
+      // NOTE: log the raw errors array
+      errors: data?.error?.errors || null,
+    });
+    if (Array.isArray(data?.error?.errors) && data.error.errors.length) {
+      console.error('[IAP][VERIFY][GOOGLE_ERROR][0]', JSON.stringify(data.error.errors[0], null, 2));
+    }
+    // ========================================
+
     console.error('[IAP] verify error:', {
       status: code,
       message: err?.message,
-      google: !!err?.response?.data,
-      data: err?.response?.data || null,
+      google: !!data,
+      data: data || null,
     });
+
     res.status(code).json({
       ok: false,
-      error: err?.response?.data || err?.message || 'Unknown error',
+      error: data || err?.message || 'Unknown error',
     });
   }
 });
