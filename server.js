@@ -1,185 +1,176 @@
-// iap-server/server.js
+// server.js
 //
-// Minimal Google Play Subscription verifier for Render/Railway/Fly etc.
-// - Health:           GET  /
-// - Verify purchase:  POST /iap/google/subscription/verify
+// Google Play subscription verifier + Partner/School access codes + Mini Admin (browser)
+// + Grace-period cache (do not drop Pro on temporary Google failures)
 //
-// Env vars you may want to set on the host (Render -> Settings -> Environment):
+// Routes:
+//   GET  /                               health
+//   POST /iap/google/subscription/verify  verify Google Play subscription (v2->v1 fallback)
+//   POST /redeem/code                     redeem partner/school code (one-time)
+//   GET  /entitlements?userId=...         check partner-code entitlement
+//
+//   GET  /admin                           mini admin UI (HTML)
+//   GET  /admin/codes/stats               stats (requires x-admin-key)
+//   POST /admin/codes/generate            generate codes (requires x-admin-key)
+//
+// Env vars (IAP):
 //   PORT
-//   PACKAGE_NAME                      e.g. com.rosenbergvictor72.pealim2
-//   SERVICE_ACCOUNT_JSON              (paste raw JSON key)  OR
-//   GOOGLE_APPLICATION_CREDENTIALS    (path to service-account.json)
-//   API_KEY                           (optional; if set, client must send x-api-key)
-//   ALLOWED_ORIGIN                    (optional; CORS allow-origin; default "*")
-//   ACK_ON_VERIFY                     (optional; "1" to auto-ack active subs on verify)
-//   ACK_ONLY_IF_ACTIVE                (optional; default "1"; if "0", ack when not active too)
-//   ENTITLE_WHILE_NOT_EXPIRED         (optional; default "1"; if "1", pro=true while not expired)
-//   ENTITLE_REQUIRE_ACK               (optional; default "1"; if "1", pro requires acknowledged)
+//   PACKAGE_NAME
+//   SERVICE_ACCOUNT_JSON                 (raw JSON string) OR GOOGLE_APPLICATION_CREDENTIALS (path)
+//   API_KEY                              (optional; if set, client must send x-api-key)
+//   ALLOWED_ORIGIN                       (optional; default "*")
 //
-// Client should POST JSON:
-//   { userId, productId, packageName, purchaseToken }
+//   ACK_ON_VERIFY=1                       (optional)
+//   ACK_ONLY_IF_ACTIVE=1                  (optional; default 1)
+//   ENTITLE_WHILE_NOT_EXPIRED=1           (optional; default 1)
+//   ENTITLE_REQUIRE_ACK=0                 (optional; default 0)
+//   ACK_REFRESH_RETRIES=2                 (optional)
+//   ACK_REFRESH_DELAY_MS=250              (optional)
 //
-// Notes:
-// - Tries SubscriptionsV2 first (no productId needed), then falls back to v1 (needs productId).
-// - Masks purchaseToken in logs.
-// - Can optionally acknowledge on server (recommended) if ACK_ON_VERIFY=1.
+//   GRACE_PERIOD_HOURS=48                 (optional; default 36)
+//     If Google verification fails (network/credentials/5xx), server can temporarily grant Pro
+//     based on last successful verification cached per userId.
 //
-// Run locally:
-//   set GOOGLE_APPLICATION_CREDENTIALS=.\service-account.json
-//   set PACKAGE_NAME=com.rosenbergvictor72.pealim2
-//   node server.js
+// Env vars (Codes):
+//   CODE_PEPPER                           (required to enable codes; long random secret)
+//   DATABASE_URL                          (optional; enables Postgres persistence)
+//   PGSSLMODE=disable                      (optional; to disable ssl)
+//   ADMIN_KEY                             (optional; enables /admin stats + /admin generate)
+//   SEED_TEST_CODES=1                      (optional; seeds TEST-1DAY and TEST-2DAYS)
+//
+// Dependencies:
+//   npm i express body-parser googleapis pg
 //
 
 const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
+const crypto = require('crypto');
 
-// ---------- Config / Env ----------
+const app = express();
+app.use(bodyParser.json());
+
+// -------------------- ENV / CONFIG --------------------
 const PORT = process.env.PORT || 3000;
+
 const PACKAGE_NAME = process.env.PACKAGE_NAME || '';
+const API_KEY = process.env.API_KEY || '';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-const API_KEY = process.env.API_KEY || '';                 // if set, require x-api-key
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';   // CORS allow-origin; "" -> "*"
-const ENABLE_CORS = true;
+const ACK_ON_VERIFY = process.env.ACK_ON_VERIFY === '1';
+const ACK_ONLY_IF_ACTIVE = process.env.ACK_ONLY_IF_ACTIVE !== '0';
+const ENTITLE_WHILE_NOT_EXPIRED = process.env.ENTITLE_WHILE_NOT_EXPIRED !== '0';
+const ENTITLE_REQUIRE_ACK = process.env.ENTITLE_REQUIRE_ACK === '1';
+const ACK_REFRESH_RETRIES = Number(process.env.ACK_REFRESH_RETRIES || 2);
+const ACK_REFRESH_DELAY_MS = Number(process.env.ACK_REFRESH_DELAY_MS || 250);
 
-const ACK_ON_VERIFY = String(process.env.ACK_ON_VERIFY || '0') === '1';
-const ACK_ONLY_IF_ACTIVE = String(process.env.ACK_ONLY_IF_ACTIVE || '1') === '1';
+const GRACE_PERIOD_HOURS = Number(process.env.GRACE_PERIOD_HOURS || 36);
+const GRACE_PERIOD_MS = Math.max(0, GRACE_PERIOD_HOURS) * 60 * 60 * 1000;
 
-// Entitlement flags
-const ENTITLE_WHILE_NOT_EXPIRED = String(process.env.ENTITLE_WHILE_NOT_EXPIRED || '1') === '1';
-const ENTITLE_REQUIRE_ACK       = String(process.env.ENTITLE_REQUIRE_ACK || '1') === '1';
+const CODE_PEPPER = process.env.CODE_PEPPER || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
-// Post-ACK refresh behavior
-const ACK_REFRESH_RETRIES   = Number(process.env.ACK_REFRESH_RETRIES || 2);
-const ACK_REFRESH_DELAY_MS  = Number(process.env.ACK_REFRESH_DELAY_MS || 1200);
+// -------------------- CORS --------------------
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type,Authorization,x-api-key,x-admin-key'
+  );
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-// If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
-// materialize a local file so GoogleAuth can read it.
-if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  const raw = process.env.SERVICE_ACCOUNT_JSON;
-  if (raw) {
-    const path = './service-account.json';
-    try {
-      fs.writeFileSync(path, raw);
-      process.env.GOOGLE_APPLICATION_CREDENTIALS = path;
-      console.log('[IAP] Materialized service-account.json from env');
-    } catch (e) {
-      console.error('[IAP] Failed to write service-account.json:', e.message);
-    }
-  }
-}
-
-try {
-  let raw = process.env.SERVICE_ACCOUNT_JSON || null;
-  if (!raw && process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    raw = fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, 'utf8');
-  }
-  if (raw) {
-    const sa = JSON.parse(raw);
-    console.log('[IAP] Using service account:', sa.client_email, 'project_id:', sa.project_id);
-  } else {
-    console.warn('[IAP] Service account JSON not found (no SERVICE_ACCOUNT_JSON and no GOOGLE_APPLICATION_CREDENTIALS file)');
-  }
-} catch (e) {
-  console.error('[IAP] Could not read/parse service-account JSON for log:', e.message);
-}
-
-// ---------- Helpers ----------
+// -------------------- Helpers --------------------
 function maskToken(t, keep = 6) {
   if (!t || typeof t !== 'string') return '';
   const head = t.slice(0, keep);
   return `${head}…(${t.length})`;
 }
 
-function msToIso(ms) {
-  const n = Number(ms);
-  if (!Number.isFinite(n)) return null;
+function requireApiKeyIfSet(req, res) {
+  if (!API_KEY) return true;
+  const provided = req.header('x-api-key') || '';
+  if (provided !== API_KEY) {
+    res.status(401).json({ ok: false, error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+function requireAdminKey(req, res) {
+  if (!ADMIN_KEY) {
+    res.status(403).json({ ok: false, error: 'ADMIN_KEY_not_set' });
+    return false;
+  }
+  const provided = req.header('x-admin-key') || '';
+  if (provided !== ADMIN_KEY) {
+    res.status(401).json({ ok: false, error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+function isoOrNull(x) {
   try {
-    return new Date(n).toISOString();
+    if (!x) return null;
+    const d = new Date(x);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
   } catch {
     return null;
   }
 }
 
-function pickMaxExpiryISO(expiries = []) {
-  const ms = expiries
-    .map((x) => (x ? Date.parse(x) : NaN))
-    .filter((n) => Number.isFinite(n));
-  if (!ms.length) return null;
-  return new Date(Math.max(...ms)).toISOString();
+function isNotExpired(expiresAtISO) {
+  if (!expiresAtISO) return false;
+  const t = Date.parse(expiresAtISO);
+  if (Number.isNaN(t)) return false;
+  return t > Date.now();
 }
 
-const ACTIVE_STATES_V2 = new Set([
-  'SUBSCRIPTION_STATE_ACTIVE',
-  'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
-  'SUBSCRIPTION_STATE_ON_HOLD',
-  'SUBSCRIPTION_STATE_PAUSED',
-]);
+// -------------------- Google Auth (robust like old server) --------------------
+// If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
+// materialize a local file so GoogleAuth can read it (helps on hosts like Render).
+function materializeServiceAccountIfNeeded() {
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return;
+  const raw = process.env.SERVICE_ACCOUNT_JSON;
+  if (!raw) return;
 
-function isAckedValue(val) {
-  const s = String(val ?? '');
-  return /ACKNOWLEDGED/i.test(s) || s === '1';
-}
-
-// Normalize SubscriptionsV2 response
-function normalizeV2(resp) {
-  const d = resp?.data || {};
-  const state = d.subscriptionState || '';
-  const expiries = Array.isArray(d.lineItems)
-    ? d.lineItems.map((li) => li?.expiryTime).filter(Boolean)
-    : [];
-  const expiresAtISO = pickMaxExpiryISO(expiries);
-
-  const renewalState = d.renewalState || '';
-  const willRenew =
-    renewalState &&
-    /RENEW/i.test(String(renewalState)) &&
-    !/CANCEL|REVOKE/i.test(String(renewalState))
-      ? true
-      : undefined;
-
-  const ackState = d.acknowledgementState || '';
-
-  return {
-    source: 'v2',
-    active: ACTIVE_STATES_V2.has(state),
-    willRenew,
-    expiresAtISO,
-    subscriptionState: state,
-    acknowledgementState: ackState || undefined,
-    orderId: d.latestOrderId || undefined,
-    regionCode: d.regionCode || undefined,
-  };
-}
-
-// Normalize v1 response (purchases.subscriptions.get)
-function normalizeV1(resp) {
-  const d = resp?.data || {};
-  const expiryMs = Number(d.expiryTimeMillis || 0);
-  const expiresAtISO = msToIso(expiryMs);
-  const nowActive = Number.isFinite(expiryMs) && expiryMs > Date.now();
-
-  let willRenew = undefined;
-  if (typeof d.autoRenewing === 'boolean') {
-    const canceled = d.cancelReason === 0 || d.cancelReason === 1 || d.cancelReason === 3;
-    willRenew = d.autoRenewing && !canceled;
+  const filePath = path.join(__dirname, 'service-account.json');
+  try {
+    fs.writeFileSync(filePath, raw, 'utf8');
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = filePath;
+    console.log('[IAP] Materialized service-account.json from SERVICE_ACCOUNT_JSON');
+  } catch (e) {
+    console.error('[IAP] Failed to write service-account.json:', e.message);
   }
-
-  return {
-    source: 'v1',
-    active: !!nowActive,
-    willRenew,
-    expiresAtISO,
-    paymentState: d.paymentState,
-    cancelReason: d.cancelReason,
-    orderId: d.orderId,
-    acknowledgementState: d.acknowledgementState, // 0/1
-    priceCurrencyCode: d.priceCurrencyCode,
-    priceAmountMicros: d.priceAmountMicros,
-  };
 }
 
+function safeLogServiceAccountIdentity() {
+  try {
+    let raw = process.env.SERVICE_ACCOUNT_JSON || null;
+    if (!raw && process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      raw = fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, 'utf8');
+    }
+    if (!raw) {
+      console.warn('[IAP] Service account JSON not found (no SERVICE_ACCOUNT_JSON and no GOOGLE_APPLICATION_CREDENTIALS file)');
+      return;
+    }
+    const sa = JSON.parse(raw);
+    console.log('[IAP] Using service account:', sa.client_email, 'project_id:', sa.project_id);
+  } catch (e) {
+    console.error('[IAP] Could not read/parse service-account JSON for log:', e.message);
+  }
+}
+
+materializeServiceAccountIfNeeded();
+safeLogServiceAccountIdentity();
+
+// Create publisher client lazily
 let publisherClient = null;
 async function getAndroidPublisher() {
   if (publisherClient) return publisherClient;
@@ -191,126 +182,933 @@ async function getAndroidPublisher() {
   return publisherClient;
 }
 
-async function sleep(ms) {
-  await new Promise((r) => setTimeout(r, ms));
+// -------------------- Normalize Google responses --------------------
+function normalizeV2(v2) {
+  const data = v2?.data || v2 || {};
+  const line = data?.lineItems?.[0] || null;
+
+  const expiresAtISO = isoOrNull(line?.expiryTime);
+
+  const ackState = line?.acknowledgementState || null;
+  const isAcked =
+    ackState === 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED' ||
+    ackState === 1 ||
+    ackState === '1';
+
+  const willRenew = !!line?.autoRenewing;
+  const rawState = line?.subscriptionState || data?.subscriptionState || null;
+
+  return {
+    api: 'v2',
+    raw: data,
+    subscriptionState: rawState,
+    acknowledgementState: ackState,
+    isAcked,
+    willRenew,
+    expiresAtISO,
+  };
 }
 
-// Acknowledge helper (v1 endpoint; works even if we read v2).
-async function acknowledgeIfNeeded(publisher, {
-  packageName, productId, purchaseToken,
-  normalized, force = false,
-}) {
-  // Need productId for v1 acknowledge; bail if missing
-  if (!productId) {
-    return { tried: false, ok: false, reason: 'no-productId' };
-  }
+function normalizeV1(v1) {
+  const data = v1?.data || v1 || {};
+  const expMs = data?.expiryTimeMillis ? Number(data.expiryTimeMillis) : null;
+  const expiresAtISO = expMs ? new Date(expMs).toISOString() : null;
 
-  // Skip if package mismatch (защита от "чужих" токенов)
-  if (PACKAGE_NAME && packageName && PACKAGE_NAME !== packageName) {
-    return { tried: false, ok: false, reason: 'wrong-package' };
-  }
+  const ackState = data?.acknowledgementState;
+  const isAcked = Number(ackState) === 1;
 
-  // Skip if already acknowledged
-  if (isAckedValue(normalized.acknowledgementState)) {
-    return { tried: false, ok: true, reason: 'already-acknowledged' };
-  }
+  const willRenew = !!data?.autoRenewing;
 
-  // If only-when-active requested, but sub not active — skip
-  if (!force && ACK_ONLY_IF_ACTIVE && !normalized.active) {
-    return { tried: false, ok: false, reason: 'not-active' };
-  }
+  return {
+    api: 'v1',
+    raw: data,
+    acknowledgementState: ackState,
+    isAcked,
+    willRenew,
+    expiresAtISO,
+  };
+}
 
-  try {
+async function ackIfNeeded({ publisher, pkg, productId, purchaseToken, normalized }) {
+  if (!ACK_ON_VERIFY) return { tried: false, ok: false, reason: 'ack-disabled' };
+
+  const notExpired = isNotExpired(normalized?.expiresAtISO);
+  if (ACK_ONLY_IF_ACTIVE && !notExpired) return { tried: false, ok: false, reason: 'not-active' };
+
+  if (normalized?.isAcked) return { tried: false, ok: true, reason: 'already-acked' };
+
+  const withRetry = async (fn) => {
+    let lastErr = null;
+    for (let i = 0; i <= ACK_REFRESH_RETRIES; i++) {
+      try {
+        await fn();
+        return { ok: true, err: null };
+      } catch (e) {
+        lastErr = e;
+        if (i < ACK_REFRESH_RETRIES) {
+          await new Promise((r) => setTimeout(r, ACK_REFRESH_DELAY_MS));
+        }
+      }
+    }
+    return { ok: false, err: lastErr };
+  };
+
+  const tryAckV2 = async () => {
+    await publisher.purchases.subscriptionsv2.acknowledge({
+      packageName: pkg,
+      token: purchaseToken,
+      requestBody: {},
+    });
+  };
+
+  const tryAckV1 = async () => {
+    if (!productId) throw new Error('productId-required-for-v1-ack');
     await publisher.purchases.subscriptions.acknowledge({
-      packageName,
+      packageName: pkg,
       subscriptionId: productId,
       token: purchaseToken,
-      requestBody: { developerPayload: 'ack-by-server' },
+      requestBody: {},
     });
-    return { tried: true, ok: true };
+  };
+
+  try {
+    if (normalized?.api === 'v2') {
+      const r = await withRetry(tryAckV2);
+      if (!r.ok) throw r.err;
+    } else {
+      const r = await withRetry(tryAckV1);
+      if (!r.ok) throw r.err;
+    }
+
+    return { tried: true, ok: true, reason: 'acked' };
   } catch (e) {
     const msg = e?.message || String(e);
-    // не ретраим заведомо «чужую» покупку
-    if (/not owned by the user/i.test(msg)) {
-      return { tried: true, ok: false, reason: 'not-owned', error: null };
+    if (msg.toLowerCase().includes('already') || msg.toLowerCase().includes('acknowledged')) {
+      return { tried: true, ok: true, reason: 'already-acked' };
     }
-    return { tried: true, ok: false, error: msg };
+    if (msg.includes('not owned') || msg.includes('Not owned')) {
+      return { tried: true, ok: false, reason: 'not-owned' };
+    }
+    return { tried: true, ok: false, reason: 'ack-failed', error: msg };
   }
 }
 
-// ---------- App ----------
-const app = express();
-app.use(bodyParser.json());
+// -------------------- Codes store (Postgres or Memory) --------------------
+let codesStore = null;
+let pgPool = null; // if DATABASE_URL set
 
-// CORS
-if (ENABLE_CORS) {
-  app.use((req, res, next) => {
-    const origin = ALLOWED_ORIGIN || '*';
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
-  });
+function normalizeAccessCode(raw) {
+  return String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '');
 }
 
-// Health
+function hashAccessCode(code) {
+  if (!CODE_PEPPER) return null;
+  return crypto.createHmac('sha256', CODE_PEPPER).update(code).digest('hex');
+}
+
+function isValidDurationDays(n) {
+  return [1, 2, 90, 180, 365].includes(Number(n));
+}
+
+function calcAccessUntilISO(days) {
+  const ms = Date.now() + Number(days) * 24 * 60 * 60 * 1000;
+  return new Date(ms).toISOString();
+}
+
+async function initPostgresIfNeeded() {
+  const hasDb = !!process.env.DATABASE_URL;
+  if (!hasDb) return null;
+
+  const { Pool } = require('pg');
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
+  });
+
+  // Ensure extension for UUID generation
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+
+  pgPool = pool;
+  return pool;
+}
+
+async function initCodesStore() {
+  const pool = await initPostgresIfNeeded();
+
+  if (pool) {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS access_codes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        partner_id TEXT,
+        duration_days INT NOT NULL CHECK (duration_days IN (1,2,90,180,365)),
+        code_hash TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        disabled_at TIMESTAMPTZ,
+        note TEXT
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS code_redemptions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code_id UUID REFERENCES access_codes(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL,
+        redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        access_until TIMESTAMPTZ NOT NULL,
+        UNIQUE(code_id)
+      );
+    `);
+
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_redemptions_user ON code_redemptions(user_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_redemptions_until ON code_redemptions(access_until);`);
+
+    codesStore = {
+      kind: 'postgres',
+      _pool: pool,
+
+      async redeem({ codeHash, userId }) {
+        const c = await pool.query(
+          `SELECT id, duration_days, disabled_at FROM access_codes WHERE code_hash = $1`,
+          [codeHash]
+        );
+        if (c.rowCount === 0) return { ok: false, error: 'invalid_code' };
+        const codeRow = c.rows[0];
+        if (codeRow.disabled_at) return { ok: false, error: 'code_disabled' };
+
+        const used = await pool.query(`SELECT user_id FROM code_redemptions WHERE code_id = $1`, [codeRow.id]);
+        if (used.rowCount > 0) return { ok: false, error: 'code_already_used' };
+
+        const accessUntil = calcAccessUntilISO(codeRow.duration_days);
+        await pool.query(
+          `INSERT INTO code_redemptions (code_id, user_id, access_until) VALUES ($1,$2,$3)`,
+          [codeRow.id, userId, accessUntil]
+        );
+        return { ok: true, durationDays: codeRow.duration_days, accessUntil };
+      },
+
+      async getEntitlement({ userId }) {
+        const r = await pool.query(
+          `SELECT access_until FROM code_redemptions WHERE user_id = $1 ORDER BY access_until DESC LIMIT 1`,
+          [userId]
+        );
+        if (r.rowCount === 0) return { pro: false, accessUntil: null };
+        const until = r.rows[0].access_until ? new Date(r.rows[0].access_until).toISOString() : null;
+        const pro = until ? Date.parse(until) > Date.now() : false;
+        return { pro, accessUntil: until };
+      },
+
+      async generateCodes({ partnerId, durationDays, count, note }) {
+        const codes = [];
+        for (let i = 0; i < count; i++) {
+          const raw = crypto
+            .randomBytes(9)
+            .toString('base64url')
+            .toUpperCase()
+            .replace(/[^A-Z0-9]/g, 'A')
+            .slice(0, 12);
+
+          const code = `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+          const codeHash = hashAccessCode(code);
+          if (!codeHash) throw new Error('CODE_PEPPER is required');
+
+          await pool.query(
+            `INSERT INTO access_codes (partner_id, duration_days, code_hash, note) VALUES ($1,$2,$3,$4)`,
+            [partnerId || null, durationDays, codeHash, note || null]
+          );
+          codes.push(code);
+        }
+        return codes;
+      },
+
+      async stats() {
+        const q = `
+          SELECT
+            COALESCE(ac.partner_id,'') AS partner_id,
+            ac.duration_days,
+            COUNT(*)::int AS total,
+            COUNT(cr.code_id)::int AS redeemed,
+            (COUNT(*) - COUNT(cr.code_id))::int AS available
+          FROM access_codes ac
+          LEFT JOIN code_redemptions cr ON cr.code_id = ac.id
+          WHERE ac.disabled_at IS NULL
+          GROUP BY COALESCE(ac.partner_id,''), ac.duration_days
+          ORDER BY partner_id, ac.duration_days;
+        `;
+        const r = await pool.query(q);
+        return r.rows;
+      },
+    };
+
+    console.log('[CODES] Store: Postgres');
+    return;
+  }
+
+  // memory fallback (dev)
+  const memoryCodes = new Map(); // codeHash -> { durationDays, disabled }
+  const memoryRedeems = new Map(); // codeHash -> { userId, accessUntil }
+
+  codesStore = {
+    kind: 'memory',
+
+    async redeem({ codeHash, userId }) {
+      const row = memoryCodes.get(codeHash);
+      if (!row) return { ok: false, error: 'invalid_code' };
+      if (row.disabled) return { ok: false, error: 'code_disabled' };
+      if (memoryRedeems.has(codeHash)) return { ok: false, error: 'code_already_used' };
+      const accessUntil = calcAccessUntilISO(row.durationDays);
+      memoryRedeems.set(codeHash, { userId, accessUntil });
+      return { ok: true, durationDays: row.durationDays, accessUntil };
+    },
+
+    async getEntitlement({ userId }) {
+      let best = null;
+      for (const { userId: u, accessUntil } of memoryRedeems.values()) {
+        if (u !== userId) continue;
+        if (!best || Date.parse(accessUntil) > Date.parse(best)) best = accessUntil;
+      }
+      const pro = best ? Date.parse(best) > Date.now() : false;
+      return { pro, accessUntil: best };
+    },
+
+    async generateCodes({ partnerId, durationDays, count, note }) {
+      const codes = [];
+      for (let i = 0; i < count; i++) {
+        const raw = crypto
+          .randomBytes(9)
+          .toString('base64url')
+          .toUpperCase()
+          .replace(/[^A-Z0-9]/g, 'A')
+          .slice(0, 12);
+        const code = `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+        const codeHash = hashAccessCode(code);
+        if (!codeHash) throw new Error('CODE_PEPPER is required');
+        memoryCodes.set(codeHash, {
+          durationDays: Number(durationDays),
+          disabled: false,
+          partnerId: partnerId || null,
+          note: note || null,
+        });
+        codes.push(code);
+      }
+      return codes;
+    },
+
+    async stats() {
+      const counts = new Map(); // key = partner|days -> {total, redeemed}
+      for (const [h, row] of memoryCodes.entries()) {
+        const key = `${row.partnerId || ''}||${row.durationDays}`;
+        if (!counts.has(key)) {
+          counts.set(key, {
+            partner_id: row.partnerId || '',
+            duration_days: row.durationDays,
+            total: 0,
+            redeemed: 0,
+          });
+        }
+        counts.get(key).total += 1;
+        if (memoryRedeems.has(h)) counts.get(key).redeemed += 1;
+      }
+      return Array.from(counts.values())
+        .map((r) => ({ ...r, available: r.total - r.redeemed }))
+        .sort((a, b) => a.partner_id.localeCompare(b.partner_id) || a.duration_days - b.duration_days);
+    },
+
+    _seedPlainCodes(list) {
+      for (const item of list) {
+        const code = normalizeAccessCode(item.code);
+        const codeHash = hashAccessCode(code);
+        if (codeHash) memoryCodes.set(codeHash, { durationDays: Number(item.durationDays), disabled: false, partnerId: '__TEST__' });
+      }
+    },
+  };
+
+  console.log('[CODES] Store: In-Memory (set DATABASE_URL for persistence)');
+}
+
+async function seedTestCodesIfNeeded() {
+  if (process.env.SEED_TEST_CODES !== '1') return;
+  if (!CODE_PEPPER) {
+    console.warn('[CODES] SEED_TEST_CODES=1 but CODE_PEPPER is missing; skip seeding');
+    return;
+  }
+  if (!codesStore) return;
+
+  const test = [
+    { code: 'TEST-1DAY', durationDays: 1 },
+    { code: 'TEST-2DAYS', durationDays: 2 },
+  ];
+
+  if (codesStore.kind === 'memory') {
+    codesStore._seedPlainCodes(test);
+    console.log('[CODES] Seeded TEST codes (memory)');
+    return;
+  }
+
+  // postgres: upsert by hash
+  for (const t of test) {
+    const h = hashAccessCode(normalizeAccessCode(t.code));
+    if (!h) continue;
+    await codesStore._pool.query(
+      `INSERT INTO access_codes (partner_id, duration_days, code_hash, note)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (code_hash) DO NOTHING`,
+      ['__TEST__', Number(t.durationDays), h, 'seed test code']
+    );
+  }
+  console.log('[CODES] Seeded TEST codes (postgres)');
+}
+
+// -------------------- IAP Grace Cache (Postgres or Memory) --------------------
+let iapCache = null; // { kind, get(userId), put(...) }
+
+async function initIapCache() {
+  if (pgPool) {
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS iap_entitlements_cache (
+        user_id TEXT PRIMARY KEY,
+        package_name TEXT,
+        product_id TEXT,
+        last_ok_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ,
+        is_acked BOOLEAN,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await pgPool.query(`CREATE INDEX IF NOT EXISTS idx_iap_cache_last_ok ON iap_entitlements_cache(last_ok_at);`);
+
+    iapCache = {
+      kind: 'postgres',
+      async get(userId) {
+        const r = await pgPool.query(
+          `SELECT user_id, package_name, product_id, last_ok_at, expires_at, is_acked
+           FROM iap_entitlements_cache
+           WHERE user_id = $1`,
+          [userId]
+        );
+        if (r.rowCount === 0) return null;
+        const row = r.rows[0];
+        return {
+          userId: row.user_id,
+          packageName: row.package_name || null,
+          productId: row.product_id || null,
+          lastOkAtISO: row.last_ok_at ? new Date(row.last_ok_at).toISOString() : null,
+          expiresAtISO: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+          isAcked: row.is_acked === true,
+        };
+      },
+      async put({ userId, packageName, productId, expiresAtISO, isAcked }) {
+        const lastOkAtISO = new Date().toISOString();
+        await pgPool.query(
+          `INSERT INTO iap_entitlements_cache (user_id, package_name, product_id, last_ok_at, expires_at, is_acked)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (user_id) DO UPDATE SET
+             package_name = EXCLUDED.package_name,
+             product_id   = EXCLUDED.product_id,
+             last_ok_at   = EXCLUDED.last_ok_at,
+             expires_at   = EXCLUDED.expires_at,
+             is_acked     = EXCLUDED.is_acked,
+             updated_at   = now()`,
+          [
+            userId,
+            packageName || null,
+            productId || null,
+            lastOkAtISO,
+            expiresAtISO ? new Date(expiresAtISO).toISOString() : null,
+            isAcked === true,
+          ]
+        );
+      },
+    };
+
+    console.log('[IAP] Grace cache: Postgres');
+    return;
+  }
+
+  // in-memory fallback
+  const mem = new Map(); // userId -> record
+  iapCache = {
+    kind: 'memory',
+    async get(userId) {
+      return mem.get(userId) || null;
+    },
+    async put({ userId, packageName, productId, expiresAtISO, isAcked }) {
+      mem.set(userId, {
+        userId,
+        packageName: packageName || null,
+        productId: productId || null,
+        lastOkAtISO: new Date().toISOString(),
+        expiresAtISO: expiresAtISO || null,
+        isAcked: isAcked === true,
+      });
+    },
+  };
+  console.log('[IAP] Grace cache: Memory (will reset on restart)');
+}
+
+function isGraceApplicable(err) {
+  // We only apply grace on "temporary" failures (network/5xx/auth glitches),
+  // not on explicit subscription invalid/not owned.
+  const status = err?.response?.status;
+  const msg = (err?.message || '').toLowerCase();
+
+  if (status && Number(status) >= 500) return true; // Google server error
+  if (msg.includes('etimedout') || msg.includes('econnreset') || msg.includes('network')) return true;
+  if (msg.includes('no key or keyfile set')) return true; // credentials missing on host (deployment/env issue)
+  if (msg.includes('unable to') && msg.includes('token')) return true;
+  if (msg.includes('invalid_grant')) return true;
+
+  // 401/403 can be temporary if GoogleAuth token refresh broke;
+  // but can also be "permissions" misconfig. We'll still allow grace window.
+  if (status === 401 || status === 403) return true;
+
+  return false;
+}
+
+async function tryGraceEntitlement({ userId }) {
+  if (!userId) return { ok: false, reason: 'no_userId' };
+  if (!GRACE_PERIOD_MS || GRACE_PERIOD_MS <= 0) return { ok: false, reason: 'grace_disabled' };
+  if (!iapCache) return { ok: false, reason: 'cache_not_ready' };
+
+  const rec = await iapCache.get(String(userId));
+  if (!rec) return { ok: false, reason: 'no_cache' };
+
+  const lastOkMs = rec.lastOkAtISO ? Date.parse(rec.lastOkAtISO) : NaN;
+  if (!Number.isFinite(lastOkMs)) return { ok: false, reason: 'bad_cache' };
+
+  const withinWindow = (Date.now() - lastOkMs) <= GRACE_PERIOD_MS;
+  if (!withinWindow) return { ok: false, reason: 'grace_window_expired', cached: rec };
+
+  // We still require "not expired" if we know expiry time
+  const notExpired = rec.expiresAtISO ? isNotExpired(rec.expiresAtISO) : true;
+
+  if (!notExpired) return { ok: false, reason: 'cached_expired', cached: rec };
+
+  return {
+    ok: true,
+    reason: 'grace_cache',
+    cached: rec,
+  };
+}
+
+// -------------------- Health --------------------
 app.get('/', (req, res) => {
   res.json({
     ok: true,
-    service: 'google-play-iap-verifier',
+    service: 'iap+codes+grace',
     package: PACKAGE_NAME || null,
     cors: ALLOWED_ORIGIN || '*',
+
     ackOnVerify: ACK_ON_VERIFY,
     ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
     entitleWhileNotExpired: ENTITLE_WHILE_NOT_EXPIRED,
     entitleRequireAck: ENTITLE_REQUIRE_ACK,
-    ackRefreshRetries: ACK_REFRESH_RETRIES,
-    ackRefreshDelayMs: ACK_REFRESH_DELAY_MS,
-    v: '1.3.0',
+
+    gracePeriodHours: GRACE_PERIOD_HOURS,
+    graceCache: iapCache?.kind || null,
+
+    codesEnabled: !!CODE_PEPPER,
+    codesStore: codesStore?.kind || null,
+    adminEnabled: !!ADMIN_KEY,
   });
 });
 
-// Verify endpoint
-app.post('/iap/google/subscription/verify', async (req, res) => {
-  try {
-    // API key (optional)
-    if (API_KEY) {
-      const provided = req.header('x-api-key') || '';
-      if (provided !== API_KEY) {
-        return res.status(401).json({ ok: false, error: 'unauthorized' });
-      }
+// -------------------- Mini Admin UI (browser) --------------------
+app.get('/admin', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Verbify Mini Admin</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;background:#0b1020;color:#e6e8ef}
+    .row{display:flex;gap:16px;flex-wrap:wrap}
+    .card{background:#121a33;border:1px solid #22305a;border-radius:12px;padding:16px;max-width:980px}
+    input,select,button,textarea{font:inherit;border-radius:10px;border:1px solid #2a3a6a;background:#0e1630;color:#e6e8ef;padding:10px}
+    input,select,textarea{width:100%}
+    label{display:block;margin:10px 0 6px;color:#aab2d5}
+    button{cursor:pointer;background:#2a5bff;border-color:#2a5bff}
+    button.secondary{background:#0e1630;border-color:#2a3a6a}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+    .ok{color:#6ee7b7}
+    .err{color:#fca5a5}
+    table{border-collapse:collapse;width:100%;margin-top:10px}
+    th,td{border-bottom:1px solid #22305a;padding:8px;text-align:left;font-size:14px}
+    .small{font-size:12px;color:#aab2d5}
+    .pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#0e1630;border:1px solid #22305a}
+  </style>
+</head>
+<body>
+  <h1>Verbify Mini Admin</h1>
+  <p class="small">Коды показываются <b>только при генерации</b> (в базе хранится только hash — это безопасно).</p>
+
+  <div class="row">
+    <div class="card" style="flex:1;min-width:300px">
+      <h2>Auth</h2>
+      <label>ADMIN_KEY</label>
+      <input id="adminKey" type="password" placeholder="Вставь ADMIN_KEY" />
+      <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
+        <button class="secondary" onclick="saveKey()">Сохранить в браузере</button>
+        <button class="secondary" onclick="clearKey()">Очистить</button>
+        <span id="authState" class="pill">не задан</span>
+      </div>
+    </div>
+
+    <div class="card" style="flex:2;min-width:320px">
+      <h2>Generate codes</h2>
+
+      <div class="row">
+        <div style="flex:1;min-width:220px">
+          <label>partnerId</label>
+          <input id="partnerId" placeholder="например: schoolA / teacher_levin" />
+        </div>
+        <div style="flex:1;min-width:220px">
+          <label>durationDays</label>
+          <select id="durationDays">
+            <option value="1">1 (тест)</option>
+            <option value="2">2 (тест)</option>
+            <option value="90">90 (3 месяца)</option>
+            <option value="180">180 (6 месяцев)</option>
+            <option value="365">365 (12 месяцев)</option>
+          </select>
+        </div>
+        <div style="flex:1;min-width:160px">
+          <label>count</label>
+          <input id="count" type="number" min="1" max="5000" value="10" />
+        </div>
+      </div>
+
+      <label>note</label>
+      <input id="note" placeholder="например: Jan 2026 batch A" />
+
+      <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+        <button onclick="generate()">Сгенерировать</button>
+        <button class="secondary" onclick="downloadCSV()" id="dlBtn" disabled>Скачать CSV</button>
+        <span id="genStatus" class="pill">—</span>
+      </div>
+
+      <div style="margin-top:12px">
+        <label>Результат (коды)</label>
+        <textarea id="codesBox" rows="8" class="mono" placeholder="Здесь появятся коды..." readonly></textarea>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Stats</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="secondary" onclick="loadStats()">Обновить статистику</button>
+      <span id="statsStatus" class="pill">—</span>
+    </div>
+    <div id="statsTable"></div>
+  </div>
+
+<script>
+  let lastGenerated = null;
+
+  function getKey(){ return sessionStorage.getItem('ADMIN_KEY') || ''; }
+  function setKey(k){ sessionStorage.setItem('ADMIN_KEY', k); }
+
+  function setAuth(ok){
+    const el = document.getElementById('authState');
+    el.textContent = ok ? 'ключ задан' : 'не задан';
+    el.className = 'pill ' + (ok ? 'ok' : '');
+  }
+
+  function saveKey(){
+    const k = document.getElementById('adminKey').value.trim();
+    if (!k) return setAuth(false);
+    setKey(k);
+    setAuth(true);
+  }
+
+  function clearKey(){
+    sessionStorage.removeItem('ADMIN_KEY');
+    document.getElementById('adminKey').value = '';
+    setAuth(false);
+  }
+
+  function setPill(id, text, ok){
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = 'pill ' + (ok ? 'ok' : 'err');
+  }
+
+  setAuth(!!getKey());
+
+  async function generate(){
+    const adminKey = getKey();
+    if (!adminKey) return setPill('genStatus', 'ADMIN_KEY не задан', false);
+
+    const partnerId = document.getElementById('partnerId').value.trim();
+    const durationDays = Number(document.getElementById('durationDays').value);
+    const count = Number(document.getElementById('count').value);
+    const note = document.getElementById('note').value.trim();
+
+    document.getElementById('codesBox').value = '';
+    document.getElementById('dlBtn').disabled = true;
+    lastGenerated = null;
+
+    setPill('genStatus', 'генерация…', true);
+
+    const r = await fetch('/admin/codes/generate', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'x-admin-key': adminKey },
+      body: JSON.stringify({ partnerId, durationDays, count, note })
+    });
+
+    const data = await r.json().catch(()=>null);
+    if (!r.ok){
+      setPill('genStatus', 'ошибка: ' + (data?.error || r.status), false);
+      return;
     }
 
-    const { userId, productId, packageName, purchaseToken } = req.body || {};
+    const codes = data?.codes || [];
+    lastGenerated = { partnerId, durationDays, note, codes };
+    document.getElementById('codesBox').value = codes.join('\\n');
+    document.getElementById('dlBtn').disabled = codes.length === 0;
+    setPill('genStatus', 'готово: ' + codes.length, true);
 
-    // ===== DEBUG INPUT FROM CLIENT =====
+    loadStats();
+  }
+
+  function downloadCSV(){
+    if (!lastGenerated) return;
+    const { partnerId, durationDays, note, codes } = lastGenerated;
+
+    const rows = [['code','partnerId','durationDays','note'], ...codes.map(c => [c, partnerId||'', String(durationDays), note||''])];
+
+    const csv = rows.map(r => r.map(v => {
+      const s = String(v ?? '');
+      return /[",\\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+    }).join(',')).join('\\n');
+
+    const blob = new Blob([csv], { type:'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'codes_' + (partnerId || 'partner') + '_' + durationDays + 'd.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function loadStats(){
+    const adminKey = getKey();
+    if (!adminKey) return setPill('statsStatus', 'ADMIN_KEY не задан', false);
+
+    setPill('statsStatus', 'загрузка…', true);
+
+    const r = await fetch('/admin/codes/stats', { headers: { 'x-admin-key': adminKey } });
+    const data = await r.json().catch(()=>null);
+
+    if (!r.ok){
+      setPill('statsStatus', 'ошибка: ' + (data?.error || r.status), false);
+      return;
+    }
+
+    setPill('statsStatus', 'ok', true);
+    renderStats(data);
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function renderStats(data){
+    const rows = data?.rows || [];
+    if (!rows.length){
+      document.getElementById('statsTable').innerHTML = '<p class="small">Нет данных.</p>';
+      return;
+    }
+
+    const html = \`
+      <table>
+        <thead>
+          <tr>
+            <th>partnerId</th>
+            <th>durationDays</th>
+            <th>total</th>
+            <th>redeemed</th>
+            <th>available</th>
+          </tr>
+        </thead>
+        <tbody>
+          \${rows.map(r => \`
+            <tr>
+              <td>\${escapeHtml(r.partner_id ?? '')}</td>
+              <td>\${r.duration_days}</td>
+              <td>\${r.total}</td>
+              <td>\${r.redeemed}</td>
+              <td>\${r.available}</td>
+            </tr>
+          \`).join('')}
+        </tbody>
+      </table>\`;
+
+    document.getElementById('statsTable').innerHTML = html;
+  }
+</script>
+</body>
+</html>`);
+});
+
+// -------------------- Admin Stats --------------------
+app.get('/admin/codes/stats', async (req, res) => {
+  try {
+    if (!requireAdminKey(req, res)) return;
+    if (!CODE_PEPPER || !codesStore) return res.json({ ok: true, rows: [] });
+    const rows = await codesStore.stats();
+    return res.json({ ok: true, rows });
+  } catch (e) {
+    console.error('[ADMIN] stats error:', e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// -------------------- Admin Generate Codes --------------------
+app.post('/admin/codes/generate', async (req, res) => {
+  try {
+    if (!requireAdminKey(req, res)) return;
+
+    const { partnerId, durationDays, count, note } = req.body || {};
+    const days = Number(durationDays);
+    const n = Math.max(1, Math.min(5000, Number(count || 0)));
+
+    if (!isValidDurationDays(days)) {
+      return res.status(400).json({ ok: false, error: 'invalid_duration_days' });
+    }
+    if (!CODE_PEPPER) return res.status(500).json({ ok: false, error: 'CODE_PEPPER_not_set' });
+    if (!codesStore) return res.status(500).json({ ok: false, error: 'codes_store_not_ready' });
+
+    const codes = await codesStore.generateCodes({
+      partnerId: String(partnerId || ''),
+      durationDays: days,
+      count: n,
+      note: note || null,
+    });
+
+    return res.json({ ok: true, partnerId: partnerId || null, durationDays: days, count: codes.length, codes });
+  } catch (e) {
+    console.error('[ADMIN] generate error:', e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// -------------------- Redeem Code --------------------
+app.post('/redeem/code', async (req, res) => {
+  try {
+    if (!requireApiKeyIfSet(req, res)) return;
+
+    const { code, userId } = req.body || {};
+    const norm = normalizeAccessCode(code);
+
+    if (!userId) return res.status(400).json({ ok: false, error: 'userId_required' });
+    if (!norm) return res.status(400).json({ ok: false, error: 'code_required' });
+    if (!CODE_PEPPER) return res.status(500).json({ ok: false, error: 'CODE_PEPPER_not_set' });
+    if (!codesStore) return res.status(500).json({ ok: false, error: 'codes_store_not_ready' });
+
+    const codeHash = hashAccessCode(norm);
+    const out = await codesStore.redeem({ codeHash, userId: String(userId) });
+
+    if (!out.ok) {
+      const status =
+        out.error === 'invalid_code' ? 404 :
+        out.error === 'code_disabled' ? 410 :
+        out.error === 'code_already_used' ? 409 : 400;
+      return res.status(status).json({ ok: false, error: out.error });
+    }
+
+    return res.json({
+      ok: true,
+      pro: true,
+      entitled: true,
+      source: 'partner_code',
+      durationDays: out.durationDays,
+      accessUntil: out.accessUntil,
+    });
+  } catch (e) {
+    console.error('[CODES] redeem error:', e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// -------------------- Entitlements (Codes only) --------------------
+app.get('/entitlements', async (req, res) => {
+  try {
+    if (!requireApiKeyIfSet(req, res)) return;
+
+    const userId = String(req.query?.userId || '').trim();
+    if (!userId) return res.status(400).json({ ok: false, error: 'userId_required' });
+
+    if (!CODE_PEPPER || !codesStore) {
+      return res.json({ ok: true, pro: false, entitled: false, source: null, accessUntil: null });
+    }
+
+    const ent = await codesStore.getEntitlement({ userId });
+    return res.json({
+      ok: true,
+      pro: !!ent.pro,
+      entitled: !!ent.pro,
+      source: ent.pro ? 'partner_code' : null,
+      accessUntil: ent.accessUntil || null,
+    });
+  } catch (e) {
+    console.error('[CODES] entitlements error:', e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// -------------------- IAP Verify --------------------
+app.post('/iap/google/subscription/verify', async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    if (!requireApiKeyIfSet(req, res)) return;
+
+    const { userId, productId, packageName, purchaseToken } = req.body || {};
+    const pkg = packageName || PACKAGE_NAME;
+
+    // --- Debug input ---
     console.log('[IAP][VERIFY][INPUT]', {
       userId: userId || null,
       productId: productId || null,
       packageName_from_client: packageName || null,
       packageName_env: PACKAGE_NAME || null,
-      pkg_effective: (packageName || PACKAGE_NAME) || null,
+      pkg_effective: pkg || null,
       purchaseToken_masked: purchaseToken ? maskToken(purchaseToken) : null,
       tokenLength: purchaseToken?.length ?? 0,
     });
-    // ==================================
-
-    const pkg = packageName || PACKAGE_NAME;
 
     if (!purchaseToken) {
-      return res.status(400).json({ ok: false, error: 'purchaseToken is required' });
+      return res.status(400).json({ ok: false, error: 'purchaseToken_required' });
     }
     if (!pkg) {
-      return res.status(400).json({ ok: false, error: 'packageName is required' });
+      return res.status(400).json({ ok: false, error: 'packageName_required' });
     }
 
+    // ---- Partner-code entitlement (always available) ----
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch (e) {
+      console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
+    }
+
+    // ---- Normal mode: call Google API ----
     const publisher = await getAndroidPublisher();
 
     let normalized = null;
     let used = 'v2';
 
-    // Try V2 (doesn't require productId)
+    // Try V2 first
     try {
       const v2 = await publisher.purchases.subscriptionsv2.get({
         packageName: pkg,
@@ -321,13 +1119,10 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       used = 'v1';
     }
 
-    // Fallback to V1 (requires productId)
+    // Fallback to V1 (needs productId)
     if (!normalized) {
       if (!productId) {
-        return res.status(400).json({
-          ok: false,
-          error: 'productId is required for v1 fallback',
-        });
+        return res.status(400).json({ ok: false, error: 'productId_required_for_v1' });
       }
       const v1 = await publisher.purchases.subscriptions.get({
         packageName: pkg,
@@ -337,161 +1132,206 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       normalized = normalizeV1(v1);
     }
 
-    // ---- Entitlement logic ----
-    const expMs = Date.parse(normalized.expiresAtISO || '') || 0;
-    const notExpired = Number.isFinite(expMs) && expMs > Date.now();
+    const notExpired = isNotExpired(normalized.expiresAtISO);
+    const isAcked = !!normalized.isAcked;
 
-    let isAcked = isAckedValue(normalized.acknowledgementState);
-
-    // Base rule: active if Google reports active
-    let entitled = !!normalized.active;
-
-    // Optional extension: entitled while not expired even if state=CANCELED
-    if (!entitled && ENTITLE_WHILE_NOT_EXPIRED && notExpired) {
-      entitled = true;
+    // Entitlement policy
+    let entitled = false;
+    if (ENTITLE_WHILE_NOT_EXPIRED) {
+      entitled = notExpired;
+    } else {
+      entitled = notExpired && !!normalized.willRenew;
     }
 
-    // Optional requirement: must be acknowledged
-    if (ENTITLE_REQUIRE_ACK && entitled && !isAcked) {
-      entitled = false;
+    if (ENTITLE_REQUIRE_ACK) {
+      entitled = entitled && isAcked;
     }
 
-    // ---- ACK (server side) ----
-    let ack = { tried: false, ok: false, reason: 'disabled' };
-    if (ACK_ON_VERIFY) {
-      ack = await acknowledgeIfNeeded(publisher, {
-        packageName: pkg,
-        productId,
-        purchaseToken,
-        normalized,
-        force: !ACK_ONLY_IF_ACTIVE,
-      });
+    // ACK attempt (optional)
+    const ack = await ackIfNeeded({
+      publisher,
+      pkg,
+      productId,
+      purchaseToken,
+      normalized,
+    });
 
-      if (ack.tried) {
-        console.log('[IAP] acknowledge attempt:', {
-          tokenMasked: maskToken(purchaseToken),
-          ok: ack.ok,
-          reason: ack.reason || null,
-          error: ack.error || null,
+    // Update grace cache ONLY on successful google verification response
+    try {
+      if (userId && iapCache) {
+        await iapCache.put({
+          userId: String(userId),
+          packageName: pkg,
+          productId: productId || null,
+          expiresAtISO: normalized.expiresAtISO || null,
+          isAcked: isAcked,
         });
       }
-
-      // Если только что ack прошёл — дёрнем короткий re-fetch (V2 приоритетно)
-      if (ack.ok && !isAcked) {
-        for (let i = 0; i < ACK_REFRESH_RETRIES; i++) {
-          await sleep(ACK_REFRESH_DELAY_MS);
-          try {
-            let refreshed;
-            try {
-              const v2r = await publisher.purchases.subscriptionsv2.get({
-                packageName: pkg,
-                token: purchaseToken,
-              });
-              refreshed = normalizeV2(v2r);
-            } catch {
-              if (productId) {
-                const v1r = await publisher.purchases.subscriptions.get({
-                  packageName: pkg,
-                  subscriptionId: productId,
-                  token: purchaseToken,
-                });
-                refreshed = normalizeV1(v1r);
-              }
-            }
-            if (refreshed) {
-              normalized = refreshed;
-              isAcked = isAckedValue(refreshed.acknowledgementState);
-              // Переоценим entitlement после ACK
-              let ent2 = !!refreshed.active || (!!ENTITLE_WHILE_NOT_EXPIRED && notExpired);
-              if (ENTITLE_REQUIRE_ACK && ent2 && !isAcked) ent2 = false;
-              entitled = ent2;
-              if (isAcked) break;
-            }
-          } catch {}
-        }
-      }
+    } catch (e) {
+      console.warn('[IAP][GRACE] cache write failed (ignored):', e?.message || e);
     }
 
-    console.log('[IAP] verify ok:', {
+    const finalEntitled = !!entitled || !!codeEnt.pro;
+
+    console.log('[IAP] verify', {
+      ms: Date.now() - startedAt,
       userId: userId || null,
-      productId: productId || null,
       packageName: pkg,
-      tokenMasked: maskToken(purchaseToken),
-      source: normalized.source,
-      subscriptionState: normalized.subscriptionState || null,
+      productId: productId || null,
+      used,
+      api: normalized.api,
       acknowledgementState: normalized.acknowledgementState || null,
       willRenew: normalized.willRenew,
       expiresAt: normalized.expiresAtISO || null,
       notExpired,
       isAcked,
-      entitled,
-      pro: entitled, // alias
-      policy: {
-        entitleWhileNotExpired: ENTITLE_WHILE_NOT_EXPIRED,
-        entitleRequireAck: ENTITLE_REQUIRE_ACK,
-      },
+      entitled_iap: entitled,
+      entitled_code: !!codeEnt.pro,
+      finalEntitled,
+      gracePeriodHours: GRACE_PERIOD_HOURS,
       ackOnVerify: ACK_ON_VERIFY,
       ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
       ackTried: ack.tried,
       ackOk: ack.ok,
       ackReason: ack.reason || null,
-      usedVersion: used,
     });
 
-    res.json({
+    return res.json({
       ok: true,
       packageName: pkg,
       userId: userId || null,
       productId: productId || null,
-      pro: !!entitled,
-      entitled: !!entitled,
+      source: entitled ? 'iap' : (codeEnt.pro ? 'partner_code' : null),
+      codeAccessUntil: codeEnt.accessUntil || null,
+      pro: finalEntitled,
+      entitled: finalEntitled,
       notExpired,
       isAcked,
       ack: { tried: ack.tried, ok: ack.ok, reason: ack.reason || null },
       ...normalized,
       usedVersion: used,
+      grace: { applied: false, reason: null },
     });
   } catch (err) {
-    const code = err?.response?.status || 500;
+    // On Google error: attempt grace cache (only for temporary failures)
+    const status = err?.response?.status || 500;
     const data = err?.response?.data;
 
-    // ===== DEBUG GOOGLE ERROR (expanded) =====
+    const msg = data?.error?.message || err?.message || null;
+    const isTemp = isGraceApplicable(err);
+
     console.error('[IAP][VERIFY][GOOGLE_ERROR]', {
-      status: code,
-      message: data?.error?.message || err?.message || null,
-      // NOTE: log the raw errors array
+      status,
+      message: msg,
       errors: data?.error?.errors || null,
+      graceApplicable: isTemp,
     });
-    if (Array.isArray(data?.error?.errors) && data.error.errors.length) {
-      console.error('[IAP][VERIFY][GOOGLE_ERROR][0]', JSON.stringify(data.error.errors[0], null, 2));
+
+    const body = req.body || {};
+    const userId = body?.userId ? String(body.userId) : null;
+    const productId = body?.productId || null;
+    const pkg = body?.packageName || PACKAGE_NAME || null;
+
+    // partner code entitlement is still allowed even if google fails
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch (e) {
+      // ignore
     }
-    // ========================================
 
-    console.error('[IAP] verify error:', {
-      status: code,
-      message: err?.message,
-      google: !!data,
-      data: data || null,
-    });
+    if (isTemp) {
+      try {
+        const gr = await tryGraceEntitlement({ userId });
+        const finalEntitled = !!gr.ok || !!codeEnt.pro;
 
-    res.status(code).json({
+        console.warn('[IAP][GRACE] applied?', {
+          userId: userId || null,
+          ok: gr.ok,
+          reason: gr.reason,
+          cachedExpiresAt: gr.cached?.expiresAtISO || null,
+          cachedLastOkAt: gr.cached?.lastOkAtISO || null,
+          entitled_code: !!codeEnt.pro,
+          finalEntitled,
+        });
+
+        if (finalEntitled) {
+          return res.status(200).json({
+            ok: true,
+            packageName: pkg,
+            userId: userId,
+            productId: productId,
+            source: gr.ok ? 'grace_cache' : 'partner_code',
+            codeAccessUntil: codeEnt.accessUntil || null,
+            pro: true,
+            entitled: true,
+            notExpired: gr.ok ? true : null,
+            isAcked: gr.ok ? (gr.cached?.isAcked === true) : null,
+            ack: { tried: false, ok: false, reason: 'grace_mode' },
+            usedVersion: 'grace',
+            grace: {
+              applied: !!gr.ok,
+              reason: gr.reason || null,
+              gracePeriodHours: GRACE_PERIOD_HOURS,
+              cached: gr.cached || null,
+            },
+            googleError: {
+              status,
+              message: msg,
+            },
+          });
+        }
+      } catch (e) {
+        console.warn('[IAP][GRACE] failed (ignored):', e?.message || e);
+      }
+    }
+
+    // If grace not applicable or no cache and no code entitlement:
+    // return original error
+    return res.status(status).json({
       ok: false,
       error: data || err?.message || 'Unknown error',
+      graceApplicable: isTemp,
+      gracePeriodHours: GRACE_PERIOD_HOURS,
     });
   }
 });
 
-// ---------- Start ----------
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('[IAP] Verification server running on port', PORT);
-  console.log('      Package:', PACKAGE_NAME || '(not set)');
-  console.log('      Key:', process.env.GOOGLE_APPLICATION_CREDENTIALS || '(via SERVICE_ACCOUNT_JSON or not set)');
-  if (API_KEY) console.log('      API key required: yes');
-  if (ALLOWED_ORIGIN) console.log('      CORS origin:', ALLOWED_ORIGIN);
-  console.log('      ACK_ON_VERIFY:', ACK_ON_VERIFY);
-  console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
-  console.log('      ENTITLE_WHILE_NOT_EXPIRED:', ENTITLE_WHILE_NOT_EXPIRED);
-  console.log('      ENTITLE_REQUIRE_ACK:', ENTITLE_REQUIRE_ACK);
-  console.log('      ACK_REFRESH_RETRIES:', ACK_REFRESH_RETRIES);
-  console.log('      ACK_REFRESH_DELAY_MS:', ACK_REFRESH_DELAY_MS);
-});
+// -------------------- Startup --------------------
+(async () => {
+  try {
+    await initCodesStore();
+    await seedTestCodesIfNeeded();
+    await initIapCache();
+  } catch (e) {
+    console.error('[INIT] failed:', e?.message || e);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log('[IAP] Server running on port', PORT);
+    console.log('      PACKAGE_NAME:', PACKAGE_NAME || '(not set)');
+    console.log('      API_KEY required:', API_KEY ? 'yes' : 'no');
+    console.log('      ALLOWED_ORIGIN:', ALLOWED_ORIGIN || '*');
+
+    console.log('      ACK_ON_VERIFY:', ACK_ON_VERIFY);
+    console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
+    console.log('      ENTITLE_WHILE_NOT_EXPIRED:', ENTITLE_WHILE_NOT_EXPIRED);
+    console.log('      ENTITLE_REQUIRE_ACK:', ENTITLE_REQUIRE_ACK);
+    console.log('      ACK_REFRESH_RETRIES:', ACK_REFRESH_RETRIES);
+    console.log('      ACK_REFRESH_DELAY_MS:', ACK_REFRESH_DELAY_MS);
+
+    console.log('      GRACE_PERIOD_HOURS:', GRACE_PERIOD_HOURS);
+    console.log('      Grace cache:', iapCache?.kind || '(not ready)');
+
+    console.log('      Codes enabled:', CODE_PEPPER ? 'yes' : 'no');
+    if (CODE_PEPPER) console.log('      Codes store:', codesStore?.kind || 'unknown');
+    console.log('      Admin enabled:', ADMIN_KEY ? 'yes' : 'no');
+    if (process.env.DATABASE_URL) console.log('      DATABASE_URL: set');
+    if (process.env.SEED_TEST_CODES === '1') console.log('      SEED_TEST_CODES=1');
+    if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      console.log('      GOOGLE_APPLICATION_CREDENTIALS:', process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    }
+  });
+})();
