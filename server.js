@@ -4,7 +4,7 @@
 //
 // Routes:
 //   GET  /                               health
-//   POST /iap/google/subscription/verify  verify Google Play subscription (v2->v1 fallback) OR (when DISABLE_GOOGLE_VERIFY=1) trust client fields
+//   POST /iap/google/subscription/verify  verify Google Play subscription (v2->v1 fallback)
 //   POST /redeem/code                     redeem partner/school code (one-time)
 //   GET  /entitlements?userId=...         check partner-code entitlement
 //
@@ -18,8 +18,6 @@
 //   SERVICE_ACCOUNT_JSON                 (raw JSON string)  OR GOOGLE_APPLICATION_CREDENTIALS (path)
 //   API_KEY                              (optional; if set, client must send x-api-key)
 //   ALLOWED_ORIGIN                       (optional; default "*")
-//
-//   DISABLE_GOOGLE_VERIFY=1               (optional; if "1" server will NOT call Google APIs; will trust client fields purchaseState/acknowledged/expiry)
 //
 //   ACK_ON_VERIFY=1                       (optional)
 //   ACK_ONLY_IF_ACTIVE=1                  (optional; default 1)
@@ -39,7 +37,6 @@
 //   npm i express body-parser googleapis jsonwebtoken pg
 //
 
-const fs = require('fs');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
@@ -54,9 +51,6 @@ const PORT = process.env.PORT || 3000;
 const PACKAGE_NAME = process.env.PACKAGE_NAME || '';
 const API_KEY = process.env.API_KEY || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-
-// ✅ NEW: disable google verify (temporary safe mode)
-const DISABLE_GOOGLE_VERIFY = process.env.DISABLE_GOOGLE_VERIFY === '1';
 
 const ACK_ON_VERIFY = process.env.ACK_ON_VERIFY === '1';
 const ACK_ONLY_IF_ACTIVE = process.env.ACK_ONLY_IF_ACTIVE !== '0';
@@ -128,69 +122,28 @@ function isNotExpired(expiresAtISO) {
   return t > Date.now();
 }
 
-// ✅ NEW: parse expiry from client fields (when DISABLE_GOOGLE_VERIFY=1)
-function clientExpiryToISO({ expiryTimeMillis, expiresAtISO }) {
-  // Prefer millis if provided
-  const ms = Number(expiryTimeMillis);
-  if (Number.isFinite(ms) && ms > 0) {
-    try {
-      return new Date(ms).toISOString();
-    } catch {}
-  }
-  // Or ISO string
-  const iso = isoOrNull(expiresAtISO);
-  return iso;
-}
-
-// -------------------- Google Auth (robust) --------------------
+// -------------------- Google Auth --------------------
 function loadServiceAccount() {
-  const raw = process.env.SERVICE_ACCOUNT_JSON;
-  if (!raw) return null;
-
-  // Typical Render/ENV issue: private_key has "\\n" instead of "\n"
-  const maybeFixed = raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw;
-
+  if (!process.env.SERVICE_ACCOUNT_JSON) return null;
   try {
-    return JSON.parse(maybeFixed);
+    return JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
   } catch (e) {
     console.error('[IAP] SERVICE_ACCOUNT_JSON parse error:', e.message);
     return null;
   }
 }
 
-// Optional: if GOOGLE_APPLICATION_CREDENTIALS not set, materialize file from env (like old server)
-(function materializeIfNeeded() {
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return;
-
-  const raw = process.env.SERVICE_ACCOUNT_JSON;
-  if (!raw) return;
-
-  const maybeFixed = raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw;
-
-  try {
-    const path = './service-account.json';
-    fs.writeFileSync(path, maybeFixed);
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = path;
-    console.log('[IAP] Materialized service-account.json from env');
-  } catch (e) {
-    console.error('[IAP] Failed to write service-account.json:', e.message);
-  }
-})();
-
 function getAuthClient() {
   const sa = loadServiceAccount();
   if (sa) {
-    console.log('[IAP] Using service account:', sa.client_email, 'project_id:', sa.project_id);
     return new google.auth.JWT(sa.client_email, null, sa.private_key, [
       'https://www.googleapis.com/auth/androidpublisher',
     ]);
   }
-
   // fallback: GOOGLE_APPLICATION_CREDENTIALS
-  const auth = new google.auth.GoogleAuth({
+  return new google.auth.GoogleAuth({
     scopes: ['https://www.googleapis.com/auth/androidpublisher'],
   });
-  return auth;
 }
 
 const authClient = getAuthClient();
@@ -502,34 +455,23 @@ async function initCodesStore() {
     },
 
     async stats() {
+      // minimal stats for memory mode (not used in prod)
       const counts = new Map(); // key = partner|days -> {total, redeemed}
       for (const [h, row] of memoryCodes.entries()) {
         const key = `${row.partnerId || ''}||${row.durationDays}`;
-        if (!counts.has(key))
-          counts.set(key, {
-            partner_id: row.partnerId || '',
-            duration_days: row.durationDays,
-            total: 0,
-            redeemed: 0,
-          });
+        if (!counts.has(key)) counts.set(key, { partner_id: row.partnerId || '', duration_days: row.durationDays, total: 0, redeemed: 0 });
         counts.get(key).total += 1;
         if (memoryRedeems.has(h)) counts.get(key).redeemed += 1;
       }
-      return Array.from(counts.values())
-        .map((r) => ({ ...r, available: r.total - r.redeemed }))
-        .sort((a, b) => a.partner_id.localeCompare(b.partner_id) || a.duration_days - b.duration_days);
+      return Array.from(counts.values()).map(r => ({ ...r, available: r.total - r.redeemed }))
+        .sort((a,b) => (a.partner_id.localeCompare(b.partner_id) || a.duration_days - b.duration_days));
     },
 
     _seedPlainCodes(list) {
       for (const item of list) {
         const code = normalizeAccessCode(item.code);
         const codeHash = hashAccessCode(code);
-        if (codeHash)
-          memoryCodes.set(codeHash, {
-            durationDays: Number(item.durationDays),
-            disabled: false,
-            partnerId: '__TEST__',
-          });
+        if (codeHash) memoryCodes.set(codeHash, { durationDays: Number(item.durationDays), disabled: false, partnerId: '__TEST__' });
       }
     },
   };
@@ -577,13 +519,10 @@ app.get('/', (req, res) => {
     service: 'iap+codes',
     package: PACKAGE_NAME || null,
     cors: ALLOWED_ORIGIN || '*',
-    disableGoogleVerify: DISABLE_GOOGLE_VERIFY,
-
     ackOnVerify: ACK_ON_VERIFY,
     ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
     entitleWhileNotExpired: ENTITLE_WHILE_NOT_EXPIRED,
     entitleRequireAck: ENTITLE_REQUIRE_ACK,
-
     codesEnabled: !!CODE_PEPPER,
     codesStore: codesStore?.kind || null,
     adminEnabled: !!ADMIN_KEY,
@@ -944,19 +883,9 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
   try {
     if (!requireApiKeyIfSet(req, res)) return;
 
-    const {
-      userId,
-      productId,
-      packageName,
-      purchaseToken,
+    const { userId, productId, packageName, purchaseToken } = req.body || {};
 
-      // ✅ NEW: fields from client (used when DISABLE_GOOGLE_VERIFY=1)
-      purchaseState,
-      acknowledged,
-      expiryTimeMillis,
-      expiresAtISO,
-    } = req.body || {};
-
+    // --- Debug input (то самое изменение из "server") ---
     console.log('[IAP][VERIFY][INPUT]', {
       userId: userId || null,
       productId: productId || null,
@@ -965,85 +894,16 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       pkg_effective: (packageName || PACKAGE_NAME) || null,
       purchaseToken_masked: purchaseToken ? maskToken(purchaseToken) : null,
       tokenLength: purchaseToken?.length ?? 0,
-
-      disableGoogleVerify: DISABLE_GOOGLE_VERIFY,
-      purchaseState: purchaseState ?? null,
-      acknowledged: acknowledged ?? null,
-      expiryTimeMillis: expiryTimeMillis ?? null,
-      expiresAtISO: expiresAtISO ?? null,
     });
+    // ----------------------------------------------------
 
-    const pkg = packageName || PACKAGE_NAME;
-    if (!pkg) return res.status(400).json({ ok: false, error: 'packageName_required' });
-
-    // ---- Partner-code entitlement (always) ----
-    let codeEnt = { pro: false, accessUntil: null };
-    try {
-      if (userId && CODE_PEPPER && codesStore) {
-        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
-      }
-    } catch (e) {
-      console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
-    }
-
-    // ✅ SAFE MODE: do NOT call Google APIs
-    if (DISABLE_GOOGLE_VERIFY) {
-      // minimal checks from client
-      const expISO = clientExpiryToISO({ expiryTimeMillis, expiresAtISO });
-      const notExpired = expISO ? isNotExpired(expISO) : true; // if client didn't send expiry -> assume true (temporary mode)
-      const isAcked =
-        acknowledged === true ||
-        acknowledged === 1 ||
-        acknowledged === '1';
-
-      const purchased =
-        purchaseState === 'PURCHASED' ||
-        purchaseState === 1 ||
-        purchaseState === '1';
-
-      // In this mode we recommend to require purchased + ack + notExpired
-      const entitledByClient = !!purchased && !!isAcked && !!notExpired;
-
-      const finalEntitled = entitledByClient || !!codeEnt.pro;
-
-      console.log('[IAP] verify (DISABLE_GOOGLE_VERIFY)', {
-        userId: userId || null,
-        packageName: pkg,
-        productId: productId || null,
-        purchased,
-        isAcked,
-        expiresAt: expISO || null,
-        notExpired,
-        entitledByClient,
-        codePro: !!codeEnt.pro,
-        finalEntitled,
-      });
-
-      return res.json({
-        ok: true,
-        packageName: pkg,
-        userId: userId || null,
-        productId: productId || null,
-
-        source: entitledByClient ? 'client_unverified' : (codeEnt.pro ? 'partner_code' : null),
-        codeAccessUntil: codeEnt.accessUntil || null,
-
-        // final
-        pro: finalEntitled,
-        entitled: finalEntitled,
-
-        // details
-        mode: 'DISABLE_GOOGLE_VERIFY',
-        purchased,
-        isAcked,
-        expiresAtISO: expISO || null,
-        notExpired,
-      });
-    }
-
-    // ---- Normal mode: call Google ----
     if (!purchaseToken) {
       return res.status(400).json({ ok: false, error: 'purchaseToken_required' });
+    }
+
+    const pkg = packageName || PACKAGE_NAME;
+    if (!pkg) {
+      return res.status(400).json({ ok: false, error: 'packageName_required' });
     }
 
     let normalized = null;
@@ -1096,6 +956,16 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       normalized,
     });
 
+    // OR with partner-code entitlement (if userId passed)
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch (e) {
+      console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
+    }
+
     const finalEntitled = !!entitled || !!codeEnt.pro;
 
     console.log('[IAP] verify', {
@@ -1142,6 +1012,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     const status = err?.response?.status || 500;
     const data = err?.response?.data;
 
+    // --- Expanded google error (то самое изменение из "server") ---
     console.error('[IAP][VERIFY][GOOGLE_ERROR]', {
       status,
       message: data?.error?.message || err?.message || null,
@@ -1150,6 +1021,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     if (Array.isArray(data?.error?.errors) && data.error.errors.length) {
       console.error('[IAP][VERIFY][GOOGLE_ERROR][0]', JSON.stringify(data.error.errors[0], null, 2));
     }
+    // --------------------------------------------------------------
 
     console.error('[IAP] verify error:', {
       status,
@@ -1179,8 +1051,6 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     console.log('      PACKAGE_NAME:', PACKAGE_NAME || '(not set)');
     console.log('      API_KEY required:', API_KEY ? 'yes' : 'no');
     console.log('      ALLOWED_ORIGIN:', ALLOWED_ORIGIN || '*');
-    console.log('      DISABLE_GOOGLE_VERIFY:', DISABLE_GOOGLE_VERIFY);
-
     console.log('      ACK_ON_VERIFY:', ACK_ON_VERIFY);
     console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
     console.log('      ENTITLE_WHILE_NOT_EXPIRED:', ENTITLE_WHILE_NOT_EXPIRED);
