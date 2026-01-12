@@ -12,7 +12,9 @@
 //   GET  /admin                           mini admin UI (HTML)
 //   GET  /admin/codes/stats               stats (requires x-admin-key)
 //   POST /admin/codes/generate            generate codes (requires x-admin-key)
-//   POST /admin/codes/disable             disable(deactivate) a code (requires x-admin-key)
+//
+//   POST /admin/codes/disable             disable code (requires x-admin-key)  (blocks future redeem)
+//   POST /admin/codes/revoke              revoke access now (requires x-admin-key) (sets access_until=now)
 //
 // Env vars (IAP):
 //   PORT
@@ -36,7 +38,7 @@
 //   CODE_PEPPER                           (required to enable codes; long random secret)
 //   DATABASE_URL                          (optional; enables Postgres persistence)
 //   PGSSLMODE=disable                      (optional; to disable ssl)
-//   ADMIN_KEY                             (optional; enables /admin stats + /admin generate + /admin disable)
+//   ADMIN_KEY                             (optional; enables /admin stats + /admin generate)
 //   SEED_TEST_CODES=1                      (optional; seeds TEST-1DAY and TEST-2DAYS)
 //
 // Dependencies:
@@ -426,18 +428,6 @@ async function initCodesStore() {
         return codes;
       },
 
-      async disableCode({ codeHash }) {
-        const r = await pool.query(
-          `UPDATE access_codes
-           SET disabled_at = now()
-           WHERE code_hash = $1 AND disabled_at IS NULL
-           RETURNING id`,
-          [codeHash]
-        );
-        if (r.rowCount === 0) return { ok: false, error: 'not_found_or_already_disabled' };
-        return { ok: true };
-      },
-
       async stats() {
         const q = `
           SELECT
@@ -455,6 +445,45 @@ async function initCodesStore() {
         const r = await pool.query(q);
         return r.rows;
       },
+
+      // Disable code (blocks future redeem)
+      async disableByCodeHash({ codeHash }) {
+        const r = await pool.query(
+          `UPDATE access_codes
+           SET disabled_at = now()
+           WHERE code_hash = $1 AND disabled_at IS NULL
+           RETURNING id`,
+          [codeHash]
+        );
+        if (r.rowCount === 0) {
+          // either invalid OR already disabled
+          const chk = await pool.query(`SELECT disabled_at FROM access_codes WHERE code_hash = $1`, [codeHash]);
+          if (chk.rowCount === 0) return { ok: false, error: 'invalid_code' };
+          return { ok: false, error: 'already_disabled' };
+        }
+        return { ok: true, disabled: true };
+      },
+
+      // Revoke access NOW if code has been redeemed (access_until = now)
+      async revokeByCodeHash({ codeHash }) {
+        const c = await pool.query(`SELECT id FROM access_codes WHERE code_hash = $1`, [codeHash]);
+        if (c.rowCount === 0) return { ok: false, error: 'invalid_code' };
+        const codeId = c.rows[0].id;
+
+        const r0 = await pool.query(`SELECT id FROM code_redemptions WHERE code_id = $1`, [codeId]);
+        if (r0.rowCount === 0) return { ok: false, error: 'not_redeemed' };
+
+        const r = await pool.query(
+          `UPDATE code_redemptions
+           SET access_until = now()
+           WHERE code_id = $1 AND access_until > now()
+           RETURNING id`,
+          [codeId]
+        );
+
+        // If access_until was already <= now, we still consider revoke "ok"
+        return { ok: true, revoked: r.rowCount };
+      },
     };
 
     console.log('[CODES] Store: Postgres');
@@ -462,7 +491,7 @@ async function initCodesStore() {
   }
 
   // memory fallback (dev)
-  const memoryCodes = new Map(); // codeHash -> { durationDays, disabled }
+  const memoryCodes = new Map(); // codeHash -> { durationDays, disabled, partnerId, note }
   const memoryRedeems = new Map(); // codeHash -> { userId, accessUntil }
 
   codesStore = {
@@ -511,18 +540,10 @@ async function initCodesStore() {
       return codes;
     },
 
-    async disableCode({ codeHash }) {
-      const row = memoryCodes.get(codeHash);
-      if (!row) return { ok: false, error: 'not_found_or_already_disabled' };
-      if (row.disabled) return { ok: false, error: 'not_found_or_already_disabled' };
-      row.disabled = true;
-      memoryCodes.set(codeHash, row);
-      return { ok: true };
-    },
-
     async stats() {
       const counts = new Map(); // key = partner|days -> {total, redeemed}
       for (const [h, row] of memoryCodes.entries()) {
+        if (row.disabled) continue;
         const key = `${row.partnerId || ''}||${row.durationDays}`;
         if (!counts.has(key)) {
           counts.set(key, {
@@ -540,6 +561,29 @@ async function initCodesStore() {
         .sort((a, b) => a.partner_id.localeCompare(b.partner_id) || a.duration_days - b.duration_days);
     },
 
+    // Disable code (blocks future redeem)
+    async disableByCodeHash({ codeHash }) {
+      const row = memoryCodes.get(codeHash);
+      if (!row) return { ok: false, error: 'invalid_code' };
+      if (row.disabled) return { ok: false, error: 'already_disabled' };
+      row.disabled = true;
+      memoryCodes.set(codeHash, row);
+      return { ok: true, disabled: true };
+    },
+
+    // Revoke access NOW if code has been redeemed
+    async revokeByCodeHash({ codeHash }) {
+      const row = memoryCodes.get(codeHash);
+      if (!row) return { ok: false, error: 'invalid_code' };
+      const redeemed = memoryRedeems.get(codeHash);
+      if (!redeemed) return { ok: false, error: 'not_redeemed' };
+
+      redeemed.accessUntil = new Date().toISOString();
+      memoryRedeems.set(codeHash, redeemed);
+
+      return { ok: true, revoked: 1 };
+    },
+
     _seedPlainCodes(list) {
       for (const item of list) {
         const code = normalizeAccessCode(item.code);
@@ -549,6 +593,7 @@ async function initCodesStore() {
             durationDays: Number(item.durationDays),
             disabled: false,
             partnerId: '__TEST__',
+            note: 'seed',
           });
       }
     },
@@ -826,7 +871,7 @@ app.get('/admin', (req, res) => {
       </div>
 
       <div style="margin-top:16px;border-top:1px solid #22305a;padding-top:14px">
-        <h3 style="margin:0 0 10px 0">Deactivate code</h3>
+        <h3 style="margin:0 0 10px 0">Deactivate code (blocks future redeem)</h3>
         <div class="row">
           <div style="flex:2;min-width:240px">
             <label>code</label>
@@ -840,9 +885,30 @@ app.get('/admin', (req, res) => {
           <span id="disableStatus" class="pill">—</span>
         </div>
         <p class="small" style="margin-top:10px">
-          Деактивация помечает код как disabled. Такой код больше нельзя активировать (redeem вернёт <span class="mono">code_disabled</span>).
+          Деактивация запрещает <b>будущую</b> активацию кода. Если код уже был активирован, доступ у пользователя не исчезнет сам по себе.
         </p>
       </div>
+
+      <div style="margin-top:16px;border-top:1px solid #22305a;padding-top:14px">
+        <h3 style="margin:0 0 10px 0">Revoke access (hard)</h3>
+        <div class="row">
+          <div style="flex:2;min-width:240px">
+            <label>code</label>
+            <input id="revokeCodeInput" class="mono" placeholder="XXXX-XXXX-XXXX" />
+          </div>
+          <div style="flex:1;min-width:180px;display:flex;align-items:flex-end">
+            <button class="secondary" onclick="revokeCode()">Отозвать доступ</button>
+          </div>
+        </div>
+        <div style="margin-top:10px">
+          <span id="revokeStatus" class="pill">—</span>
+        </div>
+        <p class="small" style="margin-top:10px">
+          Отзыв доступа <b>немедленно</b> ставит <span class="mono">access_until = now()</span> для уже активированного кода.
+          Если код ещё не активировали — вернёт <span class="mono">not_redeemed</span>.
+        </p>
+      </div>
+
     </div>
   </div>
 
@@ -924,31 +990,6 @@ app.get('/admin', (req, res) => {
     loadStats();
   }
 
-  async function disableCode(){
-    const adminKey = getKey();
-    if (!adminKey) return setPill('disableStatus', 'ADMIN_KEY не задан', false);
-
-    const code = document.getElementById('disableCodeInput').value.trim();
-    if (!code) return setPill('disableStatus', 'введите код', false);
-
-    setPill('disableStatus', 'деактивация…', true);
-
-    const r = await fetch('/admin/codes/disable', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'x-admin-key': adminKey },
-      body: JSON.stringify({ code })
-    });
-
-    const data = await r.json().catch(()=>null);
-    if (!r.ok){
-      setPill('disableStatus', 'ошибка: ' + (data?.error || r.status), false);
-      return;
-    }
-
-    setPill('disableStatus', 'готово', true);
-    loadStats();
-  }
-
   function downloadCSV(){
     if (!lastGenerated) return;
     const { partnerId, durationDays, note, codes } = lastGenerated;
@@ -1026,6 +1067,56 @@ app.get('/admin', (req, res) => {
 
     document.getElementById('statsTable').innerHTML = html;
   }
+
+  async function disableCode(){
+    const adminKey = getKey();
+    if (!adminKey) return setPill('disableStatus', 'ADMIN_KEY не задан', false);
+
+    const code = document.getElementById('disableCodeInput').value.trim();
+    if (!code) return setPill('disableStatus', 'введите код', false);
+
+    setPill('disableStatus', 'деактивация…', true);
+
+    const r = await fetch('/admin/codes/disable', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'x-admin-key': adminKey },
+      body: JSON.stringify({ code })
+    });
+
+    const data = await r.json().catch(()=>null);
+    if (!r.ok){
+      setPill('disableStatus', 'ошибка: ' + (data?.error || r.status), false);
+      return;
+    }
+
+    setPill('disableStatus', 'готово', true);
+    loadStats();
+  }
+
+  async function revokeCode(){
+    const adminKey = getKey();
+    if (!adminKey) return setPill('revokeStatus', 'ADMIN_KEY не задан', false);
+
+    const code = document.getElementById('revokeCodeInput').value.trim();
+    if (!code) return setPill('revokeStatus', 'введите код', false);
+
+    setPill('revokeStatus', 'отзыв…', true);
+
+    const r = await fetch('/admin/codes/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'x-admin-key': adminKey },
+      body: JSON.stringify({ code })
+    });
+
+    const data = await r.json().catch(()=>null);
+    if (!r.ok){
+      setPill('revokeStatus', 'ошибка: ' + (data?.error || r.status), false);
+      return;
+    }
+
+    setPill('revokeStatus', 'готово (revoked: ' + (data?.revoked ?? 0) + ')', true);
+    loadStats();
+  }
 </script>
 </body>
 </html>`);
@@ -1073,7 +1164,7 @@ app.post('/admin/codes/generate', async (req, res) => {
   }
 });
 
-// -------------------- Admin Disable Code --------------------
+// -------------------- Admin Disable Code (blocks future redeem) --------------------
 app.post('/admin/codes/disable', async (req, res) => {
   try {
     if (!requireAdminKey(req, res)) return;
@@ -1086,13 +1177,47 @@ app.post('/admin/codes/disable', async (req, res) => {
     if (!codesStore) return res.status(500).json({ ok: false, error: 'codes_store_not_ready' });
 
     const codeHash = hashAccessCode(norm);
-    const out = await codesStore.disableCode({ codeHash });
+    const out = await codesStore.disableByCodeHash({ codeHash });
 
-    if (!out.ok) return res.status(404).json({ ok: false, error: out.error });
+    if (!out.ok) {
+      const status =
+        out.error === 'invalid_code' ? 404 :
+        out.error === 'already_disabled' ? 409 : 400;
+      return res.status(status).json({ ok: false, error: out.error });
+    }
 
     return res.json({ ok: true, disabled: true });
   } catch (e) {
     console.error('[ADMIN] disable error:', e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// -------------------- Admin Revoke Code (hard stop access) --------------------
+app.post('/admin/codes/revoke', async (req, res) => {
+  try {
+    if (!requireAdminKey(req, res)) return;
+
+    const { code } = req.body || {};
+    const norm = normalizeAccessCode(code);
+
+    if (!norm) return res.status(400).json({ ok: false, error: 'code_required' });
+    if (!CODE_PEPPER) return res.status(500).json({ ok: false, error: 'CODE_PEPPER_not_set' });
+    if (!codesStore) return res.status(500).json({ ok: false, error: 'codes_store_not_ready' });
+
+    const codeHash = hashAccessCode(norm);
+    const out = await codesStore.revokeByCodeHash({ codeHash });
+
+    if (!out.ok) {
+      const status =
+        out.error === 'invalid_code' ? 404 :
+        out.error === 'not_redeemed' ? 409 : 400;
+      return res.status(status).json({ ok: false, error: out.error });
+    }
+
+    return res.json({ ok: true, revoked: out.revoked || 0 });
+  } catch (e) {
+    console.error('[ADMIN] revoke error:', e);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
@@ -1298,7 +1423,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       packageName: pkg,
       userId: userId || null,
       productId: productId || null,
-      source: entitled ? 'iap' : (codeEnt.pro ? 'partner_code' : null),
+      source: entitled ? 'iap' : codeEnt.pro ? 'partner_code' : null,
       codeAccessUntil: codeEnt.accessUntil || null,
       pro: finalEntitled,
       entitled: finalEntitled,
@@ -1365,7 +1490,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
             pro: true,
             entitled: true,
             notExpired: gr.ok ? true : null,
-            isAcked: gr.ok ? (gr.cached?.isAcked === true) : null,
+            isAcked: gr.ok ? gr.cached?.isAcked === true : null,
             ack: { tried: false, ok: false, reason: 'grace_mode' },
             usedVersion: 'grace',
             grace: {
