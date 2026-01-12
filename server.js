@@ -12,6 +12,7 @@
 //   GET  /admin                           mini admin UI (HTML)
 //   GET  /admin/codes/stats               stats (requires x-admin-key)
 //   POST /admin/codes/generate            generate codes (requires x-admin-key)
+//   POST /admin/codes/disable             disable(deactivate) a code (requires x-admin-key)
 //
 // Env vars (IAP):
 //   PORT
@@ -35,7 +36,7 @@
 //   CODE_PEPPER                           (required to enable codes; long random secret)
 //   DATABASE_URL                          (optional; enables Postgres persistence)
 //   PGSSLMODE=disable                      (optional; to disable ssl)
-//   ADMIN_KEY                             (optional; enables /admin stats + /admin generate)
+//   ADMIN_KEY                             (optional; enables /admin stats + /admin generate + /admin disable)
 //   SEED_TEST_CODES=1                      (optional; seeds TEST-1DAY and TEST-2DAYS)
 //
 // Dependencies:
@@ -157,7 +158,9 @@ function safeLogServiceAccountIdentity() {
       raw = fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, 'utf8');
     }
     if (!raw) {
-      console.warn('[IAP] Service account JSON not found (no SERVICE_ACCOUNT_JSON and no GOOGLE_APPLICATION_CREDENTIALS file)');
+      console.warn(
+        '[IAP] Service account JSON not found (no SERVICE_ACCOUNT_JSON and no GOOGLE_APPLICATION_CREDENTIALS file)'
+      );
       return;
     }
     const sa = JSON.parse(raw);
@@ -423,6 +426,18 @@ async function initCodesStore() {
         return codes;
       },
 
+      async disableCode({ codeHash }) {
+        const r = await pool.query(
+          `UPDATE access_codes
+           SET disabled_at = now()
+           WHERE code_hash = $1 AND disabled_at IS NULL
+           RETURNING id`,
+          [codeHash]
+        );
+        if (r.rowCount === 0) return { ok: false, error: 'not_found_or_already_disabled' };
+        return { ok: true };
+      },
+
       async stats() {
         const q = `
           SELECT
@@ -496,6 +511,15 @@ async function initCodesStore() {
       return codes;
     },
 
+    async disableCode({ codeHash }) {
+      const row = memoryCodes.get(codeHash);
+      if (!row) return { ok: false, error: 'not_found_or_already_disabled' };
+      if (row.disabled) return { ok: false, error: 'not_found_or_already_disabled' };
+      row.disabled = true;
+      memoryCodes.set(codeHash, row);
+      return { ok: true };
+    },
+
     async stats() {
       const counts = new Map(); // key = partner|days -> {total, redeemed}
       for (const [h, row] of memoryCodes.entries()) {
@@ -520,7 +544,12 @@ async function initCodesStore() {
       for (const item of list) {
         const code = normalizeAccessCode(item.code);
         const codeHash = hashAccessCode(code);
-        if (codeHash) memoryCodes.set(codeHash, { durationDays: Number(item.durationDays), disabled: false, partnerId: '__TEST__' });
+        if (codeHash)
+          memoryCodes.set(codeHash, {
+            durationDays: Number(item.durationDays),
+            disabled: false,
+            partnerId: '__TEST__',
+          });
       }
     },
   };
@@ -678,7 +707,7 @@ async function tryGraceEntitlement({ userId }) {
   const lastOkMs = rec.lastOkAtISO ? Date.parse(rec.lastOkAtISO) : NaN;
   if (!Number.isFinite(lastOkMs)) return { ok: false, reason: 'bad_cache' };
 
-  const withinWindow = (Date.now() - lastOkMs) <= GRACE_PERIOD_MS;
+  const withinWindow = Date.now() - lastOkMs <= GRACE_PERIOD_MS;
   if (!withinWindow) return { ok: false, reason: 'grace_window_expired', cached: rec };
 
   // We still require "not expired" if we know expiry time
@@ -795,6 +824,25 @@ app.get('/admin', (req, res) => {
         <label>Результат (коды)</label>
         <textarea id="codesBox" rows="8" class="mono" placeholder="Здесь появятся коды..." readonly></textarea>
       </div>
+
+      <div style="margin-top:16px;border-top:1px solid #22305a;padding-top:14px">
+        <h3 style="margin:0 0 10px 0">Deactivate code</h3>
+        <div class="row">
+          <div style="flex:2;min-width:240px">
+            <label>code</label>
+            <input id="disableCodeInput" class="mono" placeholder="XXXX-XXXX-XXXX" />
+          </div>
+          <div style="flex:1;min-width:180px;display:flex;align-items:flex-end">
+            <button class="secondary" onclick="disableCode()">Деактивировать</button>
+          </div>
+        </div>
+        <div style="margin-top:10px">
+          <span id="disableStatus" class="pill">—</span>
+        </div>
+        <p class="small" style="margin-top:10px">
+          Деактивация помечает код как disabled. Такой код больше нельзя активировать (redeem вернёт <span class="mono">code_disabled</span>).
+        </p>
+      </div>
     </div>
   </div>
 
@@ -873,6 +921,31 @@ app.get('/admin', (req, res) => {
     document.getElementById('dlBtn').disabled = codes.length === 0;
     setPill('genStatus', 'готово: ' + codes.length, true);
 
+    loadStats();
+  }
+
+  async function disableCode(){
+    const adminKey = getKey();
+    if (!adminKey) return setPill('disableStatus', 'ADMIN_KEY не задан', false);
+
+    const code = document.getElementById('disableCodeInput').value.trim();
+    if (!code) return setPill('disableStatus', 'введите код', false);
+
+    setPill('disableStatus', 'деактивация…', true);
+
+    const r = await fetch('/admin/codes/disable', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'x-admin-key': adminKey },
+      body: JSON.stringify({ code })
+    });
+
+    const data = await r.json().catch(()=>null);
+    if (!r.ok){
+      setPill('disableStatus', 'ошибка: ' + (data?.error || r.status), false);
+      return;
+    }
+
+    setPill('disableStatus', 'готово', true);
     loadStats();
   }
 
@@ -996,6 +1069,30 @@ app.post('/admin/codes/generate', async (req, res) => {
     return res.json({ ok: true, partnerId: partnerId || null, durationDays: days, count: codes.length, codes });
   } catch (e) {
     console.error('[ADMIN] generate error:', e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// -------------------- Admin Disable Code --------------------
+app.post('/admin/codes/disable', async (req, res) => {
+  try {
+    if (!requireAdminKey(req, res)) return;
+
+    const { code } = req.body || {};
+    const norm = normalizeAccessCode(code);
+
+    if (!norm) return res.status(400).json({ ok: false, error: 'code_required' });
+    if (!CODE_PEPPER) return res.status(500).json({ ok: false, error: 'CODE_PEPPER_not_set' });
+    if (!codesStore) return res.status(500).json({ ok: false, error: 'codes_store_not_ready' });
+
+    const codeHash = hashAccessCode(norm);
+    const out = await codesStore.disableCode({ codeHash });
+
+    if (!out.ok) return res.status(404).json({ ok: false, error: out.error });
+
+    return res.json({ ok: true, disabled: true });
+  } catch (e) {
+    console.error('[ADMIN] disable error:', e);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
