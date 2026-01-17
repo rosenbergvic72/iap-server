@@ -276,27 +276,55 @@ async function ackIfNeeded({ publisher, pkg, productId, purchaseToken, normalize
     });
   };
 
+  const formatErr = (e) => {
+    const status = e?.response?.status;
+    const apiMsg =
+      e?.response?.data?.error?.message ||
+      e?.response?.data?.error_description ||
+      null;
+    const msg = apiMsg || e?.message || String(e);
+    return status ? `[${status}] ${msg}` : msg;
+  };
+
   try {
+    // ---- Prefer ACK via V2, but fallback to V1 if V2 fails ----
     if (normalized?.api === 'v2') {
-      const r = await withRetry(tryAckV2);
-      if (!r.ok) throw r.err;
-    } else {
-      const r = await withRetry(tryAckV1);
-      if (!r.ok) throw r.err;
+      const r2 = await withRetry(tryAckV2);
+      if (r2.ok) return { tried: true, ok: true, reason: 'acked-v2' };
+
+      // fallback to v1 if we can
+      if (productId) {
+        const r1 = await withRetry(tryAckV1);
+        if (r1.ok) return { tried: true, ok: true, reason: 'acked-v1-fallback' };
+        return { tried: true, ok: false, reason: 'ack-failed', error: formatErr(r1.err) };
+      }
+
+      return { tried: true, ok: false, reason: 'ack-failed', error: formatErr(r2.err) };
     }
 
-    return { tried: true, ok: true, reason: 'acked' };
+    // ---- V1 path ----
+    const r1 = await withRetry(tryAckV1);
+    if (!r1.ok) throw r1.err;
+
+    return { tried: true, ok: true, reason: 'acked-v1' };
   } catch (e) {
-    const msg = e?.message || String(e);
-    if (msg.toLowerCase().includes('already') || msg.toLowerCase().includes('acknowledged')) {
+    const msg = formatErr(e);
+
+    const low = msg.toLowerCase();
+    if (low.includes('already') || low.includes('acknowledged')) {
       return { tried: true, ok: true, reason: 'already-acked' };
     }
-    if (msg.includes('not owned') || msg.includes('Not owned')) {
-      return { tried: true, ok: false, reason: 'not-owned' };
+    if (low.includes('not owned')) {
+      return { tried: true, ok: false, reason: 'not-owned', error: msg };
     }
+    if (low.includes('permission') || low.includes('insufficient')) {
+      return { tried: true, ok: false, reason: 'ack-permission', error: msg };
+    }
+
     return { tried: true, ok: false, reason: 'ack-failed', error: msg };
   }
 }
+
 
 // -------------------- Codes store (Postgres or Memory) --------------------
 let codesStore = null;
@@ -1416,6 +1444,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       ackTried: ack.tried,
       ackOk: ack.ok,
       ackReason: ack.reason || null,
+      ackError: ack.error || null,
     });
 
     return res.json({
