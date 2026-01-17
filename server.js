@@ -1369,42 +1369,66 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       used = 'v1';
     }
 
-    // Fallback to V1 (needs productId)
-    if (!normalized) {
-      if (!productId) {
-        return res.status(400).json({ ok: false, error: 'productId_required_for_v1' });
-      }
-      const v1 = await publisher.purchases.subscriptions.get({
-        packageName: pkg,
-        subscriptionId: productId,
-        token: purchaseToken,
-      });
-      normalized = normalizeV1(v1);
-    }
+// Fallback to V1 (needs productId)
+if (!normalized) {
+  if (!productId) {
+    return res.status(400).json({ ok: false, error: 'productId_required_for_v1' });
+  }
+  const v1 = await publisher.purchases.subscriptions.get({
+    packageName: pkg,
+    subscriptionId: productId,
+    token: purchaseToken,
+  });
+  normalized = normalizeV1(v1);
+}
 
-    const notExpired = isNotExpired(normalized.expiresAtISO);
-    const isAcked = !!normalized.isAcked;
+// --- read grace-cache (to avoid repeating ACK every verify) ---
+let cached = null;
+try {
+  if (userId && iapCache) cached = await iapCache.get(String(userId));
+} catch (e) {
+  // ignore cache read errors
+}
 
-    // Entitlement policy
-    let entitled = false;
-    if (ENTITLE_WHILE_NOT_EXPIRED) {
-      entitled = notExpired;
-    } else {
-      entitled = notExpired && !!normalized.willRenew;
-    }
+const notExpired = isNotExpired(normalized.expiresAtISO);
 
-    if (ENTITLE_REQUIRE_ACK) {
-      entitled = entitled && isAcked;
-    }
+// v2 часто возвращает acknowledgementState=null, поэтому “помним” ack через кэш
+const isAckedBefore = !!normalized.isAcked || cached?.isAcked === true;
 
-    // ACK attempt (optional)
-    const ack = await ackIfNeeded({
-      publisher,
-      pkg,
-      productId,
-      purchaseToken,
-      normalized,
-    });
+let ack;
+if (!isAckedBefore) {
+  // ACK attempt (optional)
+  ack = await ackIfNeeded({
+    publisher,
+    pkg,
+    productId,
+    purchaseToken,
+    normalized,
+  });
+} else {
+  // уже ack’нули раньше — не долбим acknowledge снова
+  ack = { tried: false, ok: true, reason: 'cached-acked' };
+}
+
+const isAckedFinal = isAckedBefore || ack.ok === true;
+
+// чтобы ниже (логи/ответ/кэш) видели актуальный ack-статус
+normalized.isAcked = isAckedFinal;
+
+// Entitlement policy
+let entitled = false;
+if (ENTITLE_WHILE_NOT_EXPIRED) {
+  entitled = notExpired;
+} else {
+  entitled = notExpired && !!normalized.willRenew;
+}
+
+if (ENTITLE_REQUIRE_ACK) {
+  entitled = entitled && isAckedFinal; // ✅ используем финальный
+}
+
+
+
 
     // Update grace cache ONLY on successful google verification response
     try {
@@ -1414,7 +1438,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
           packageName: pkg,
           productId: productId || null,
           expiresAtISO: normalized.expiresAtISO || null,
-          isAcked: isAcked,
+          isAcked: isAckedFinal,
         });
       }
     } catch (e) {
@@ -1434,7 +1458,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       willRenew: normalized.willRenew,
       expiresAt: normalized.expiresAtISO || null,
       notExpired,
-      isAcked,
+      isAcked: isAckedFinal,
       entitled_iap: entitled,
       entitled_code: !!codeEnt.pro,
       finalEntitled,
@@ -1457,7 +1481,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       pro: finalEntitled,
       entitled: finalEntitled,
       notExpired,
-      isAcked,
+      isAcked: isAckedFinal,
       ack: { tried: ack.tried, ok: ack.ok, reason: ack.reason || null },
       ...normalized,
       usedVersion: used,
