@@ -1393,11 +1393,20 @@ try {
 const notExpired = isNotExpired(normalized.expiresAtISO);
 
 // v2 часто возвращает acknowledgementState=null, поэтому “помним” ack через кэш
-const isAckedBefore = !!normalized.isAcked || cached?.isAcked === true;
+// IMPORTANT: do NOT let cached ack-status prevent an actual acknowledge call.
+// We only use cache as a *fallback signal* for UI/telemetry, but we still attempt
+// to acknowledge if the API response does not clearly say it is acknowledged.
+//
+// apiAcked: what Google API says right now (or what we could reliably infer).
+// cachedAcked: our local "grace" cache (may be stale / incorrect).
+const cachedAcked = cached?.isAcked === true;
+const apiAcked = normalized.isAcked === true;
 
-let ack;
-if (!isAckedBefore) {
-  // ACK attempt (optional)
+let ack = { tried: false, ok: false, reason: null, error: null };
+
+// If API does NOT confirm acknowledgement, try to acknowledge.
+// (Even if cache says "acked", cache might be wrong; do not skip.)
+if (!apiAcked) {
   ack = await ackIfNeeded({
     publisher,
     pkg,
@@ -1405,15 +1414,21 @@ if (!isAckedBefore) {
     purchaseToken,
     normalized,
   });
-} else {
-  // уже ack’нули раньше — не долбим acknowledge снова
-  ack = { tried: false, ok: true, reason: 'cached-acked' };
 }
 
-const isAckedFinal = isAckedBefore || ack.ok === true;
+const isAckedFinal = apiAcked || ack.ok === true || cachedAcked;
 
-// чтобы ниже (логи/ответ/кэш) видели актуальный ack-статус
+// Improve diagnostics (keeps old log field useful)
+if (!ack.reason) {
+  if (apiAcked) ack.reason = 'api-acked';
+  else if (ack.ok === true) ack.reason = 'ack-ok';
+  else if (cachedAcked) ack.reason = 'cached-acked';
+}
+
+// For logs/response/cache below
 normalized.isAcked = isAckedFinal;
+normalized._ackReason =
+  apiAcked ? 'api-acked' : (ack.ok === true ? (ack.reason || 'ack-ok') : (cachedAcked ? 'cached-acked' : null));
 
 // Entitlement policy
 let entitled = false;
