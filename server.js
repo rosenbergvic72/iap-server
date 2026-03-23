@@ -1,48 +1,52 @@
 // server.js
 //
-// Google Play subscription verifier + Partner/School access codes + Mini Admin (browser)
-// + Grace-period cache (do not drop Pro on temporary Google failures)
+// Google Play subscription verifier + Apple subscription verifier
+// + Partner/School access codes + Mini Admin (browser)
+// + Grace-period cache (do not drop Pro on temporary failures)
 //
 // Routes:
-//   GET  /                               health
-//   POST /iap/google/subscription/verify  verify Google Play subscription (v2->v1 fallback)
-//   POST /redeem/code                     redeem partner/school code (one-time)
-//   GET  /entitlements?userId=...         check partner-code entitlement
+//   GET  /                                 health
+//   POST /iap/google/subscription/verify   verify Google Play subscription (v2->v1 fallback)
+//   POST /iap/apple/subscription/verify    verify Apple auto-renewable subscription (receipt verify)
+//   POST /redeem/code                      redeem partner/school code (one-time)
+//   GET  /entitlements?userId=...          check partner-code entitlement
 //
-//   GET  /admin                           mini admin UI (HTML)
-//   GET  /admin/codes/stats               stats (requires x-admin-key)
-//   POST /admin/codes/generate            generate codes (requires x-admin-key)
-//
-//   POST /admin/codes/disable             disable code (requires x-admin-key)  (blocks future redeem)
-//   POST /admin/codes/revoke              revoke access now (requires x-admin-key) (sets access_until=now)
+//   GET  /admin                            mini admin UI (HTML)
+//   GET  /admin/codes/stats                stats (requires x-admin-key)
+//   POST /admin/codes/generate             generate codes (requires x-admin-key)
+//   POST /admin/codes/disable              disable code (requires x-admin-key)
+//   POST /admin/codes/revoke               revoke access now (requires x-admin-key)
 //
 // Env vars (IAP):
 //   PORT
 //   PACKAGE_NAME
-//   SERVICE_ACCOUNT_JSON                 (raw JSON string) OR GOOGLE_APPLICATION_CREDENTIALS (path)
-//   API_KEY                              (optional; if set, client must send x-api-key)
-//   ALLOWED_ORIGIN                       (optional; default "*")
+//   SERVICE_ACCOUNT_JSON                   (raw JSON string) OR GOOGLE_APPLICATION_CREDENTIALS (path)
+//   API_KEY                                (optional; if set, client must send x-api-key)
+//   ALLOWED_ORIGIN                         (optional; default "*")
 //
-//   ACK_ON_VERIFY=1                       (optional)
-//   ACK_ONLY_IF_ACTIVE=1                  (optional; default 1)
-//   ENTITLE_WHILE_NOT_EXPIRED=1           (optional; default 1)
-//   ENTITLE_REQUIRE_ACK=0                 (optional; default 0)
-//   ACK_REFRESH_RETRIES=2                 (optional)
-//   ACK_REFRESH_DELAY_MS=250              (optional)
+//   APPLE_SHARED_SECRET                    (required for Apple receipt verification)
 //
-//   GRACE_PERIOD_HOURS=48                 (optional; default 36)
-//     If Google verification fails (network/credentials/5xx), server can temporarily grant Pro
+//   ACK_ON_VERIFY=1                        (optional)
+//   ACK_ONLY_IF_ACTIVE=1                   (optional; default 1)
+//   ENTITLE_WHILE_NOT_EXPIRED=1            (optional; default 1)
+//   ENTITLE_REQUIRE_ACK=0                  (optional; default 0)
+//   ACK_REFRESH_RETRIES=2                  (optional)
+//   ACK_REFRESH_DELAY_MS=250               (optional)
+//
+//   GRACE_PERIOD_HOURS=48                  (optional; default 36)
+//     If store verification fails temporarily, server can temporarily grant Pro
 //     based on last successful verification cached per userId.
 //
 // Env vars (Codes):
-//   CODE_PEPPER                           (required to enable codes; long random secret)
-//   DATABASE_URL                          (optional; enables Postgres persistence)
+//   CODE_PEPPER                            (required to enable codes; long random secret)
+//   DATABASE_URL                           (optional; enables Postgres persistence)
 //   PGSSLMODE=disable                      (optional; to disable ssl)
-//   ADMIN_KEY                             (optional; enables /admin stats + /admin generate)
+//   ADMIN_KEY                              (optional; enables /admin stats + /admin generate)
 //   SEED_TEST_CODES=1                      (optional; seeds TEST-1DAY and TEST-2DAYS)
 //
 // Dependencies:
 //   npm i express body-parser googleapis pg
+//   npm i node-fetch   (only if Node < 18 and fetch is not available globally)
 //
 
 const fs = require('fs');
@@ -53,7 +57,20 @@ const { google } = require('googleapis');
 const crypto = require('crypto');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
+
+// -------------------- Fetch helper --------------------
+let _fetchImpl = null;
+async function getFetch() {
+  if (_fetchImpl) return _fetchImpl;
+  if (typeof fetch === 'function') {
+    _fetchImpl = fetch.bind(globalThis);
+    return _fetchImpl;
+  }
+  const mod = await import('node-fetch');
+  _fetchImpl = mod.default;
+  return _fetchImpl;
+}
 
 // -------------------- ENV / CONFIG --------------------
 const PORT = process.env.PORT || 3000;
@@ -61,6 +78,7 @@ const PORT = process.env.PORT || 3000;
 const PACKAGE_NAME = process.env.PACKAGE_NAME || '';
 const API_KEY = process.env.API_KEY || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || '';
 
 const ACK_ON_VERIFY = process.env.ACK_ON_VERIFY === '1';
 const ACK_ONLY_IF_ACTIVE = process.env.ACK_ONLY_IF_ACTIVE !== '0';
@@ -133,6 +151,19 @@ function isNotExpired(expiresAtISO) {
   const t = Date.parse(expiresAtISO);
   if (Number.isNaN(t)) return false;
   return t > Date.now();
+}
+
+function truthyBool(v) {
+  return v === true || v === 1 || v === '1';
+}
+
+function combineWithCodeEntitlement({ storeEntitled, codeEnt }) {
+  const finalEntitled = !!storeEntitled || !!codeEnt?.pro;
+  return {
+    finalEntitled,
+    source: storeEntitled ? 'iap' : codeEnt?.pro ? 'partner_code' : null,
+    codeAccessUntil: codeEnt?.accessUntil || null,
+  };
 }
 
 // -------------------- Google Auth (robust like old server) --------------------
@@ -287,12 +318,10 @@ async function ackIfNeeded({ publisher, pkg, productId, purchaseToken, normalize
   };
 
   try {
-    // ---- Prefer ACK via V2, but fallback to V1 if V2 fails ----
     if (normalized?.api === 'v2') {
       const r2 = await withRetry(tryAckV2);
       if (r2.ok) return { tried: true, ok: true, reason: 'acked-v2' };
 
-      // fallback to v1 if we can
       if (productId) {
         const r1 = await withRetry(tryAckV1);
         if (r1.ok) return { tried: true, ok: true, reason: 'acked-v1-fallback' };
@@ -302,7 +331,6 @@ async function ackIfNeeded({ publisher, pkg, productId, purchaseToken, normalize
       return { tried: true, ok: false, reason: 'ack-failed', error: formatErr(r2.err) };
     }
 
-    // ---- V1 path ----
     const r1 = await withRetry(tryAckV1);
     if (!r1.ok) throw r1.err;
 
@@ -325,6 +353,124 @@ async function ackIfNeeded({ publisher, pkg, productId, purchaseToken, normalize
   }
 }
 
+// -------------------- Apple helpers --------------------
+function pickLatestAppleTxn(candidates) {
+  if (!Array.isArray(candidates) || !candidates.length) return null;
+  return candidates
+    .slice()
+    .sort((a, b) => {
+      const ea = Number(a?.expires_date_ms || 0);
+      const eb = Number(b?.expires_date_ms || 0);
+      return eb - ea;
+    })[0];
+}
+
+function normalizeAppleReceiptPayload({ receiptJson, requestedProductId }) {
+  const latest = Array.isArray(receiptJson?.latest_receipt_info)
+    ? receiptJson.latest_receipt_info
+    : [];
+
+  const pendingRenewal = Array.isArray(receiptJson?.pending_renewal_info)
+    ? receiptJson.pending_renewal_info
+    : [];
+
+  const filtered = requestedProductId
+    ? latest.filter((x) => x?.product_id === requestedProductId)
+    : latest;
+
+  const selectedPool = filtered.length ? filtered : latest;
+  const txn = pickLatestAppleTxn(selectedPool);
+
+  if (!txn) {
+    return {
+      ok: true,
+      platform: 'ios',
+      productId: requestedProductId || null,
+      source: null,
+      pro: false,
+      entitled: false,
+      expiresAt: null,
+      notExpired: false,
+      willRenew: false,
+      isInBillingRetryPeriod: false,
+      cancellationDate: null,
+      appleStatus: receiptJson?.status ?? null,
+      raw: receiptJson,
+    };
+  }
+
+  const productId = txn.product_id || requestedProductId || null;
+  const expiresMs = Number(txn.expires_date_ms || 0);
+  const expiresAt = expiresMs ? new Date(expiresMs).toISOString() : null;
+  const notExpired = expiresMs > Date.now();
+
+  const cancellationDate = isoOrNull(txn.cancellation_date_ms || txn.cancellation_date || null);
+  const isCancelled = !!cancellationDate;
+
+  const renewalInfo = pendingRenewal.find((x) => x?.product_id === productId) || null;
+  const willRenew = renewalInfo?.auto_renew_status === '1';
+  const isInBillingRetryPeriod = renewalInfo?.is_in_billing_retry_period === '1';
+
+  // Право доступа: подписка не истекла и транзакция не отменена/refunded
+  const entitled = notExpired && !isCancelled;
+
+  return {
+    ok: true,
+    platform: 'ios',
+    productId,
+    source: entitled ? 'iap' : null,
+    pro: entitled,
+    entitled,
+    expiresAt,
+    notExpired,
+    willRenew,
+    isInBillingRetryPeriod,
+    cancellationDate,
+    appleStatus: receiptJson?.status ?? null,
+    raw: receiptJson,
+  };
+}
+
+async function verifyAppleReceiptWithFallback(receipt) {
+  const f = await getFetch();
+
+  const postToApple = async (url) => {
+    const resp = await f(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        'receipt-data': receipt,
+        password: APPLE_SHARED_SECRET,
+        'exclude-old-transactions': false,
+      }),
+    });
+
+    const text = await resp.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+
+    return { status: resp.status, json, rawText: text };
+  };
+
+  let prod = await postToApple('https://buy.itunes.apple.com/verifyReceipt');
+
+  // Sandbox receipt sent to production
+  if (prod?.json?.status === 21007) {
+    const sbx = await postToApple('https://sandbox.itunes.apple.com/verifyReceipt');
+    return { env: 'sandbox', ...sbx };
+  }
+
+  // Production receipt accidentally sent to sandbox
+  if (prod?.json?.status === 21008) {
+    return { env: 'production', ...prod };
+  }
+
+  return { env: 'production', ...prod };
+}
 
 // -------------------- Codes store (Postgres or Memory) --------------------
 let codesStore = null;
@@ -361,7 +507,6 @@ async function initPostgresIfNeeded() {
     ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
   });
 
-  // Ensure extension for UUID generation
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
   pgPool = pool;
@@ -474,7 +619,6 @@ async function initCodesStore() {
         return r.rows;
       },
 
-      // Disable code (blocks future redeem)
       async disableByCodeHash({ codeHash }) {
         const r = await pool.query(
           `UPDATE access_codes
@@ -484,7 +628,6 @@ async function initCodesStore() {
           [codeHash]
         );
         if (r.rowCount === 0) {
-          // either invalid OR already disabled
           const chk = await pool.query(`SELECT disabled_at FROM access_codes WHERE code_hash = $1`, [codeHash]);
           if (chk.rowCount === 0) return { ok: false, error: 'invalid_code' };
           return { ok: false, error: 'already_disabled' };
@@ -492,7 +635,6 @@ async function initCodesStore() {
         return { ok: true, disabled: true };
       },
 
-      // Revoke access NOW if code has been redeemed (access_until = now)
       async revokeByCodeHash({ codeHash }) {
         const c = await pool.query(`SELECT id FROM access_codes WHERE code_hash = $1`, [codeHash]);
         if (c.rowCount === 0) return { ok: false, error: 'invalid_code' };
@@ -509,7 +651,6 @@ async function initCodesStore() {
           [codeId]
         );
 
-        // If access_until was already <= now, we still consider revoke "ok"
         return { ok: true, revoked: r.rowCount };
       },
     };
@@ -518,9 +659,8 @@ async function initCodesStore() {
     return;
   }
 
-  // memory fallback (dev)
-  const memoryCodes = new Map(); // codeHash -> { durationDays, disabled, partnerId, note }
-  const memoryRedeems = new Map(); // codeHash -> { userId, accessUntil }
+  const memoryCodes = new Map();
+  const memoryRedeems = new Map();
 
   codesStore = {
     kind: 'memory',
@@ -569,7 +709,7 @@ async function initCodesStore() {
     },
 
     async stats() {
-      const counts = new Map(); // key = partner|days -> {total, redeemed}
+      const counts = new Map();
       for (const [h, row] of memoryCodes.entries()) {
         if (row.disabled) continue;
         const key = `${row.partnerId || ''}||${row.durationDays}`;
@@ -589,7 +729,6 @@ async function initCodesStore() {
         .sort((a, b) => a.partner_id.localeCompare(b.partner_id) || a.duration_days - b.duration_days);
     },
 
-    // Disable code (blocks future redeem)
     async disableByCodeHash({ codeHash }) {
       const row = memoryCodes.get(codeHash);
       if (!row) return { ok: false, error: 'invalid_code' };
@@ -599,7 +738,6 @@ async function initCodesStore() {
       return { ok: true, disabled: true };
     },
 
-    // Revoke access NOW if code has been redeemed
     async revokeByCodeHash({ codeHash }) {
       const row = memoryCodes.get(codeHash);
       if (!row) return { ok: false, error: 'invalid_code' };
@@ -649,7 +787,6 @@ async function seedTestCodesIfNeeded() {
     return;
   }
 
-  // postgres: upsert by hash
   for (const t of test) {
     const h = hashAccessCode(normalizeAccessCode(t.code));
     if (!h) continue;
@@ -664,7 +801,7 @@ async function seedTestCodesIfNeeded() {
 }
 
 // -------------------- IAP Grace Cache (Postgres or Memory) --------------------
-let iapCache = null; // { kind, get(userId), put(...) }
+let iapCache = null;
 
 async function initIapCache() {
   if (pgPool) {
@@ -673,6 +810,7 @@ async function initIapCache() {
         user_id TEXT PRIMARY KEY,
         package_name TEXT,
         product_id TEXT,
+        platform TEXT,
         last_ok_at TIMESTAMPTZ NOT NULL,
         expires_at TIMESTAMPTZ,
         is_acked BOOLEAN,
@@ -685,7 +823,7 @@ async function initIapCache() {
       kind: 'postgres',
       async get(userId) {
         const r = await pgPool.query(
-          `SELECT user_id, package_name, product_id, last_ok_at, expires_at, is_acked
+          `SELECT user_id, package_name, product_id, platform, last_ok_at, expires_at, is_acked
            FROM iap_entitlements_cache
            WHERE user_id = $1`,
           [userId]
@@ -696,19 +834,21 @@ async function initIapCache() {
           userId: row.user_id,
           packageName: row.package_name || null,
           productId: row.product_id || null,
+          platform: row.platform || null,
           lastOkAtISO: row.last_ok_at ? new Date(row.last_ok_at).toISOString() : null,
           expiresAtISO: row.expires_at ? new Date(row.expires_at).toISOString() : null,
           isAcked: row.is_acked === true,
         };
       },
-      async put({ userId, packageName, productId, expiresAtISO, isAcked }) {
+      async put({ userId, packageName, productId, platform, expiresAtISO, isAcked }) {
         const lastOkAtISO = new Date().toISOString();
         await pgPool.query(
-          `INSERT INTO iap_entitlements_cache (user_id, package_name, product_id, last_ok_at, expires_at, is_acked)
-           VALUES ($1,$2,$3,$4,$5,$6)
+          `INSERT INTO iap_entitlements_cache (user_id, package_name, product_id, platform, last_ok_at, expires_at, is_acked)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
            ON CONFLICT (user_id) DO UPDATE SET
              package_name = EXCLUDED.package_name,
              product_id   = EXCLUDED.product_id,
+             platform     = EXCLUDED.platform,
              last_ok_at   = EXCLUDED.last_ok_at,
              expires_at   = EXCLUDED.expires_at,
              is_acked     = EXCLUDED.is_acked,
@@ -717,6 +857,7 @@ async function initIapCache() {
             userId,
             packageName || null,
             productId || null,
+            platform || null,
             lastOkAtISO,
             expiresAtISO ? new Date(expiresAtISO).toISOString() : null,
             isAcked === true,
@@ -729,18 +870,18 @@ async function initIapCache() {
     return;
   }
 
-  // in-memory fallback
-  const mem = new Map(); // userId -> record
+  const mem = new Map();
   iapCache = {
     kind: 'memory',
     async get(userId) {
       return mem.get(userId) || null;
     },
-    async put({ userId, packageName, productId, expiresAtISO, isAcked }) {
+    async put({ userId, packageName, productId, platform, expiresAtISO, isAcked }) {
       mem.set(userId, {
         userId,
         packageName: packageName || null,
         productId: productId || null,
+        platform: platform || null,
         lastOkAtISO: new Date().toISOString(),
         expiresAtISO: expiresAtISO || null,
         isAcked: isAcked === true,
@@ -751,19 +892,14 @@ async function initIapCache() {
 }
 
 function isGraceApplicable(err) {
-  // We only apply grace on "temporary" failures (network/5xx/auth glitches),
-  // not on explicit subscription invalid/not owned.
   const status = err?.response?.status;
   const msg = (err?.message || '').toLowerCase();
 
-  if (status && Number(status) >= 500) return true; // Google server error
+  if (status && Number(status) >= 500) return true;
   if (msg.includes('etimedout') || msg.includes('econnreset') || msg.includes('network')) return true;
-  if (msg.includes('no key or keyfile set')) return true; // credentials missing on host (deployment/env issue)
+  if (msg.includes('no key or keyfile set')) return true;
   if (msg.includes('unable to') && msg.includes('token')) return true;
   if (msg.includes('invalid_grant')) return true;
-
-  // 401/403 can be temporary if GoogleAuth token refresh broke;
-  // but can also be "permissions" misconfig. We'll still allow grace window.
   if (status === 401 || status === 403) return true;
 
   return false;
@@ -783,9 +919,7 @@ async function tryGraceEntitlement({ userId }) {
   const withinWindow = Date.now() - lastOkMs <= GRACE_PERIOD_MS;
   if (!withinWindow) return { ok: false, reason: 'grace_window_expired', cached: rec };
 
-  // We still require "not expired" if we know expiry time
   const notExpired = rec.expiresAtISO ? isNotExpired(rec.expiresAtISO) : true;
-
   if (!notExpired) return { ok: false, reason: 'cached_expired', cached: rec };
 
   return {
@@ -810,6 +944,8 @@ app.get('/', (req, res) => {
 
     gracePeriodHours: GRACE_PERIOD_HOURS,
     graceCache: iapCache?.kind || null,
+
+    appleSharedSecretConfigured: !!APPLE_SHARED_SECRET,
 
     codesEnabled: !!CODE_PEPPER,
     codesStore: codesStore?.kind || null,
@@ -1185,7 +1321,13 @@ app.post('/admin/codes/generate', async (req, res) => {
       note: note || null,
     });
 
-    return res.json({ ok: true, partnerId: partnerId || null, durationDays: days, count: codes.length, codes });
+    return res.json({
+      ok: true,
+      partnerId: partnerId || null,
+      durationDays: days,
+      count: codes.length,
+      codes,
+    });
   } catch (e) {
     console.error('[ADMIN] generate error:', e);
     return res.status(500).json({ ok: false, error: 'internal_error' });
@@ -1314,7 +1456,7 @@ app.get('/entitlements', async (req, res) => {
   }
 });
 
-// -------------------- IAP Verify --------------------
+// -------------------- IAP Verify: Google --------------------
 app.post('/iap/google/subscription/verify', async (req, res) => {
   const startedAt = Date.now();
 
@@ -1324,8 +1466,7 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     const { userId, productId, packageName, purchaseToken } = req.body || {};
     const pkg = packageName || PACKAGE_NAME;
 
-    // --- Debug input ---
-    console.log('[IAP][VERIFY][INPUT]', {
+    console.log('[IAP][GOOGLE][VERIFY][INPUT]', {
       userId: userId || null,
       productId: productId || null,
       packageName_from_client: packageName || null,
@@ -1342,7 +1483,6 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'packageName_required' });
     }
 
-    // ---- Partner-code entitlement (always available) ----
     let codeEnt = { pro: false, accessUntil: null };
     try {
       if (userId && CODE_PEPPER && codesStore) {
@@ -1352,13 +1492,11 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
     }
 
-    // ---- Normal mode: call Google API ----
     const publisher = await getAndroidPublisher();
 
     let normalized = null;
     let used = 'v2';
 
-    // Try V2 first
     try {
       const v2 = await publisher.purchases.subscriptionsv2.get({
         packageName: pkg,
@@ -1369,89 +1507,70 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       used = 'v1';
     }
 
-// Fallback to V1 (needs productId)
-if (!normalized) {
-  if (!productId) {
-    return res.status(400).json({ ok: false, error: 'productId_required_for_v1' });
-  }
-  const v1 = await publisher.purchases.subscriptions.get({
-    packageName: pkg,
-    subscriptionId: productId,
-    token: purchaseToken,
-  });
-  normalized = normalizeV1(v1);
-}
+    if (!normalized) {
+      if (!productId) {
+        return res.status(400).json({ ok: false, error: 'productId_required_for_v1' });
+      }
+      const v1 = await publisher.purchases.subscriptions.get({
+        packageName: pkg,
+        subscriptionId: productId,
+        token: purchaseToken,
+      });
+      normalized = normalizeV1(v1);
+    }
 
-// --- read grace-cache (to avoid repeating ACK every verify) ---
-let cached = null;
-try {
-  if (userId && iapCache) cached = await iapCache.get(String(userId));
-} catch (e) {
-  // ignore cache read errors
-}
+    let cached = null;
+    try {
+      if (userId && iapCache) cached = await iapCache.get(String(userId));
+    } catch {}
 
-const notExpired = isNotExpired(normalized.expiresAtISO);
+    const notExpired = isNotExpired(normalized.expiresAtISO);
 
-// v2 часто возвращает acknowledgementState=null, поэтому “помним” ack через кэш
-// IMPORTANT: do NOT let cached ack-status prevent an actual acknowledge call.
-// We only use cache as a *fallback signal* for UI/telemetry, but we still attempt
-// to acknowledge if the API response does not clearly say it is acknowledged.
-//
-// apiAcked: what Google API says right now (or what we could reliably infer).
-// cachedAcked: our local "grace" cache (may be stale / incorrect).
-const cachedAcked = cached?.isAcked === true;
-const apiAcked = normalized.isAcked === true;
+    const cachedAcked = cached?.isAcked === true;
+    const apiAcked = normalized.isAcked === true;
 
-let ack = { tried: false, ok: false, reason: null, error: null };
+    let ack = { tried: false, ok: false, reason: null, error: null };
 
-// If API does NOT confirm acknowledgement, try to acknowledge.
-// (Even if cache says "acked", cache might be wrong; do not skip.)
-if (!apiAcked) {
-  ack = await ackIfNeeded({
-    publisher,
-    pkg,
-    productId,
-    purchaseToken,
-    normalized,
-  });
-}
+    if (!apiAcked) {
+      ack = await ackIfNeeded({
+        publisher,
+        pkg,
+        productId,
+        purchaseToken,
+        normalized,
+      });
+    }
 
-const isAckedFinal = apiAcked || ack.ok === true || cachedAcked;
+    const isAckedFinal = apiAcked || ack.ok === true || cachedAcked;
 
-// Improve diagnostics (keeps old log field useful)
-if (!ack.reason) {
-  if (apiAcked) ack.reason = 'api-acked';
-  else if (ack.ok === true) ack.reason = 'ack-ok';
-  else if (cachedAcked) ack.reason = 'cached-acked';
-}
+    if (!ack.reason) {
+      if (apiAcked) ack.reason = 'api-acked';
+      else if (ack.ok === true) ack.reason = 'ack-ok';
+      else if (cachedAcked) ack.reason = 'cached-acked';
+    }
 
-// For logs/response/cache below
-normalized.isAcked = isAckedFinal;
-normalized._ackReason =
-  apiAcked ? 'api-acked' : (ack.ok === true ? (ack.reason || 'ack-ok') : (cachedAcked ? 'cached-acked' : null));
+    normalized.isAcked = isAckedFinal;
+    normalized._ackReason =
+      apiAcked ? 'api-acked' : (ack.ok === true ? (ack.reason || 'ack-ok') : (cachedAcked ? 'cached-acked' : null));
 
-// Entitlement policy
-let entitled = false;
-if (ENTITLE_WHILE_NOT_EXPIRED) {
-  entitled = notExpired;
-} else {
-  entitled = notExpired && !!normalized.willRenew;
-}
+    let entitled = false;
+    if (ENTITLE_WHILE_NOT_EXPIRED) {
+      entitled = notExpired;
+    } else {
+      entitled = notExpired && !!normalized.willRenew;
+    }
 
-if (ENTITLE_REQUIRE_ACK) {
-  entitled = entitled && isAckedFinal; // ✅ используем финальный
-}
+    if (ENTITLE_REQUIRE_ACK) {
+      entitled = entitled && isAckedFinal;
+    }
 
-
-
-
-    // Update grace cache ONLY on successful google verification response
     try {
       if (userId && iapCache) {
         await iapCache.put({
           userId: String(userId),
           packageName: pkg,
           productId: productId || null,
+          platform: 'android',
           expiresAtISO: normalized.expiresAtISO || null,
           isAcked: isAckedFinal,
         });
@@ -1460,9 +1579,9 @@ if (ENTITLE_REQUIRE_ACK) {
       console.warn('[IAP][GRACE] cache write failed (ignored):', e?.message || e);
     }
 
-    const finalEntitled = !!entitled || !!codeEnt.pro;
+    const combined = combineWithCodeEntitlement({ storeEntitled: entitled, codeEnt });
 
-    console.log('[IAP] verify', {
+    console.log('[IAP][GOOGLE] verify', {
       ms: Date.now() - startedAt,
       userId: userId || null,
       packageName: pkg,
@@ -1476,7 +1595,7 @@ if (ENTITLE_REQUIRE_ACK) {
       isAcked: isAckedFinal,
       entitled_iap: entitled,
       entitled_code: !!codeEnt.pro,
-      finalEntitled,
+      finalEntitled: combined.finalEntitled,
       gracePeriodHours: GRACE_PERIOD_HOURS,
       ackOnVerify: ACK_ON_VERIFY,
       ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
@@ -1488,13 +1607,14 @@ if (ENTITLE_REQUIRE_ACK) {
 
     return res.json({
       ok: true,
+      platform: 'android',
       packageName: pkg,
       userId: userId || null,
       productId: productId || null,
-      source: entitled ? 'iap' : codeEnt.pro ? 'partner_code' : null,
-      codeAccessUntil: codeEnt.accessUntil || null,
-      pro: finalEntitled,
-      entitled: finalEntitled,
+      source: combined.source,
+      codeAccessUntil: combined.codeAccessUntil,
+      pro: combined.finalEntitled,
+      entitled: combined.finalEntitled,
       notExpired,
       isAcked: isAckedFinal,
       ack: { tried: ack.tried, ok: ack.ok, reason: ack.reason || null },
@@ -1503,10 +1623,8 @@ if (ENTITLE_REQUIRE_ACK) {
       grace: { applied: false, reason: null },
     });
   } catch (err) {
-    // On Google error: attempt grace cache (only for temporary failures)
     const status = err?.response?.status || 500;
     const data = err?.response?.data;
-
     const msg = data?.error?.message || err?.message || null;
     const isTemp = isGraceApplicable(err);
 
@@ -1522,37 +1640,35 @@ if (ENTITLE_REQUIRE_ACK) {
     const productId = body?.productId || null;
     const pkg = body?.packageName || PACKAGE_NAME || null;
 
-    // partner code entitlement is still allowed even if google fails
     let codeEnt = { pro: false, accessUntil: null };
     try {
       if (userId && CODE_PEPPER && codesStore) {
         codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch {}
 
     if (isTemp) {
       try {
         const gr = await tryGraceEntitlement({ userId });
-        const finalEntitled = !!gr.ok || !!codeEnt.pro;
+        const combined = combineWithCodeEntitlement({ storeEntitled: !!gr.ok, codeEnt });
 
-        console.warn('[IAP][GRACE] applied?', {
+        console.warn('[IAP][GRACE][GOOGLE] applied?', {
           userId: userId || null,
           ok: gr.ok,
           reason: gr.reason,
           cachedExpiresAt: gr.cached?.expiresAtISO || null,
           cachedLastOkAt: gr.cached?.lastOkAtISO || null,
           entitled_code: !!codeEnt.pro,
-          finalEntitled,
+          finalEntitled: combined.finalEntitled,
         });
 
-        if (finalEntitled) {
+        if (combined.finalEntitled) {
           return res.status(200).json({
             ok: true,
+            platform: 'android',
             packageName: pkg,
-            userId: userId,
-            productId: productId,
+            userId,
+            productId,
             source: gr.ok ? 'grace_cache' : 'partner_code',
             codeAccessUntil: codeEnt.accessUntil || null,
             pro: true,
@@ -1574,16 +1690,209 @@ if (ENTITLE_REQUIRE_ACK) {
           });
         }
       } catch (e) {
-        console.warn('[IAP][GRACE] failed (ignored):', e?.message || e);
+        console.warn('[IAP][GRACE][GOOGLE] failed (ignored):', e?.message || e);
       }
     }
 
-    // If grace not applicable or no cache and no code entitlement:
-    // return original error
     return res.status(status).json({
       ok: false,
       error: data || err?.message || 'Unknown error',
       graceApplicable: isTemp,
+      gracePeriodHours: GRACE_PERIOD_HOURS,
+    });
+  }
+});
+
+// -------------------- IAP Verify: Apple --------------------
+app.post('/iap/apple/subscription/verify', async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    if (!requireApiKeyIfSet(req, res)) return;
+
+    const { userId, productId, receipt, purchaseToken } = req.body || {};
+    const effectiveReceipt = receipt || purchaseToken || null;
+
+    console.log('[IAP][APPLE][VERIFY][INPUT]', {
+      userId: userId || null,
+      productId: productId || null,
+      receipt_present: !!effectiveReceipt,
+      receipt_length: effectiveReceipt?.length || 0,
+    });
+
+    if (!effectiveReceipt) {
+      return res.status(400).json({ ok: false, error: 'receipt_required' });
+    }
+    if (!APPLE_SHARED_SECRET) {
+      return res.status(500).json({ ok: false, error: 'APPLE_SHARED_SECRET_not_set' });
+    }
+
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch (e) {
+      console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
+    }
+
+    const appleResp = await verifyAppleReceiptWithFallback(effectiveReceipt);
+
+    console.log('[IAP][APPLE][RAW_STATUS]', {
+      env: appleResp?.env || null,
+      httpStatus: appleResp?.status || null,
+      appleStatus: appleResp?.json?.status ?? null,
+    });
+
+    if (!appleResp?.json || typeof appleResp.json.status === 'undefined') {
+      throw new Error('apple_verify_bad_response');
+    }
+
+    // Apple status 0 = valid
+    if (appleResp.json.status !== 0) {
+      const combined = combineWithCodeEntitlement({ storeEntitled: false, codeEnt });
+
+      return res.json({
+        ok: true,
+        platform: 'ios',
+        userId: userId || null,
+        productId: productId || null,
+        source: combined.source,
+        codeAccessUntil: combined.codeAccessUntil,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        notExpired: false,
+        isAcked: null,
+        ack: { tried: false, ok: false, reason: null },
+        appleStatus: appleResp.json.status,
+        grace: { applied: false, reason: null },
+      });
+    }
+
+    const normalized = normalizeAppleReceiptPayload({
+      receiptJson: appleResp.json,
+      requestedProductId: productId || null,
+    });
+
+    const entitled = !!normalized.entitled;
+
+    try {
+      if (userId && iapCache && normalized.expiresAt) {
+        await iapCache.put({
+          userId: String(userId),
+          packageName: null,
+          productId: normalized.productId || productId || null,
+          platform: 'ios',
+          expiresAtISO: normalized.expiresAt,
+          isAcked: true, // Apple receipt path doesn't use Google-style ack
+        });
+      }
+    } catch (e) {
+      console.warn('[IAP][GRACE][APPLE] cache write failed (ignored):', e?.message || e);
+    }
+
+    const combined = combineWithCodeEntitlement({ storeEntitled: entitled, codeEnt });
+
+    console.log('[IAP][APPLE] verify', {
+      ms: Date.now() - startedAt,
+      userId: userId || null,
+      productId: normalized.productId || productId || null,
+      env: appleResp.env || null,
+      expiresAt: normalized.expiresAt || null,
+      notExpired: normalized.notExpired,
+      willRenew: normalized.willRenew,
+      cancellationDate: normalized.cancellationDate || null,
+      entitled_iap: entitled,
+      entitled_code: !!codeEnt.pro,
+      finalEntitled: combined.finalEntitled,
+    });
+
+    return res.json({
+      ok: true,
+      platform: 'ios',
+      userId: userId || null,
+      productId: normalized.productId || productId || null,
+      source: combined.source,
+      codeAccessUntil: combined.codeAccessUntil,
+      pro: combined.finalEntitled,
+      entitled: combined.finalEntitled,
+      expiresAt: normalized.expiresAt || null,
+      notExpired: normalized.notExpired,
+      willRenew: normalized.willRenew,
+      isInBillingRetryPeriod: normalized.isInBillingRetryPeriod,
+      cancellationDate: normalized.cancellationDate || null,
+      appleStatus: normalized.appleStatus,
+      isAcked: true,
+      ack: { tried: false, ok: true, reason: 'apple-receipt-verified' },
+      usedVersion: appleResp.env || 'apple',
+      grace: { applied: false, reason: null },
+    });
+  } catch (err) {
+    const msg = err?.message || 'Unknown error';
+    const userId = req.body?.userId ? String(req.body.userId) : null;
+    const productId = req.body?.productId || null;
+
+    console.error('[IAP][VERIFY][APPLE_ERROR]', {
+      message: msg,
+    });
+
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch {}
+
+    // For Apple we treat transport/temporary receipt verification failures similarly:
+    // allow grace only if cached entitlement exists and is still not expired.
+    try {
+      const gr = await tryGraceEntitlement({ userId });
+      const combined = combineWithCodeEntitlement({ storeEntitled: !!gr.ok, codeEnt });
+
+      console.warn('[IAP][GRACE][APPLE] applied?', {
+        userId: userId || null,
+        ok: gr.ok,
+        reason: gr.reason,
+        cachedExpiresAt: gr.cached?.expiresAtISO || null,
+        cachedLastOkAt: gr.cached?.lastOkAtISO || null,
+        entitled_code: !!codeEnt.pro,
+        finalEntitled: combined.finalEntitled,
+      });
+
+      if (combined.finalEntitled) {
+        return res.status(200).json({
+          ok: true,
+          platform: 'ios',
+          userId,
+          productId,
+          source: gr.ok ? 'grace_cache' : 'partner_code',
+          codeAccessUntil: codeEnt.accessUntil || null,
+          pro: true,
+          entitled: true,
+          expiresAt: gr.cached?.expiresAtISO || null,
+          notExpired: gr.ok ? true : null,
+          isAcked: true,
+          ack: { tried: false, ok: true, reason: 'grace_mode' },
+          usedVersion: 'grace',
+          grace: {
+            applied: !!gr.ok,
+            reason: gr.reason || null,
+            gracePeriodHours: GRACE_PERIOD_HOURS,
+            cached: gr.cached || null,
+          },
+          appleError: {
+            message: msg,
+          },
+        });
+      }
+    } catch (e) {
+      console.warn('[IAP][GRACE][APPLE] failed (ignored):', e?.message || e);
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: msg,
+      graceApplicable: true,
       gracePeriodHours: GRACE_PERIOD_HOURS,
     });
   }
@@ -1604,6 +1913,8 @@ if (ENTITLE_REQUIRE_ACK) {
     console.log('      PACKAGE_NAME:', PACKAGE_NAME || '(not set)');
     console.log('      API_KEY required:', API_KEY ? 'yes' : 'no');
     console.log('      ALLOWED_ORIGIN:', ALLOWED_ORIGIN || '*');
+
+    console.log('      APPLE_SHARED_SECRET:', APPLE_SHARED_SECRET ? 'set' : 'not set');
 
     console.log('      ACK_ON_VERIFY:', ACK_ON_VERIFY);
     console.log('      ACK_ONLY_IF_ACTIVE:', ACK_ONLY_IF_ACTIVE);
