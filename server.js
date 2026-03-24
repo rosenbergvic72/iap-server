@@ -440,7 +440,6 @@ async function verifyAppleReceiptWithFallback(receipt) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         'receipt-data': receipt,
-        password: APPLE_SHARED_SECRET,
         'exclude-old-transactions': false,
       }),
     });
@@ -458,13 +457,11 @@ async function verifyAppleReceiptWithFallback(receipt) {
 
   let prod = await postToApple('https://buy.itunes.apple.com/verifyReceipt');
 
-  // Sandbox receipt sent to production
   if (prod?.json?.status === 21007) {
     const sbx = await postToApple('https://sandbox.itunes.apple.com/verifyReceipt');
     return { env: 'sandbox', ...sbx };
   }
 
-  // Production receipt accidentally sent to sandbox
   if (prod?.json?.status === 21008) {
     return { env: 'production', ...prod };
   }
@@ -1723,10 +1720,7 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
     if (!effectiveReceipt) {
       return res.status(400).json({ ok: false, error: 'receipt_required' });
     }
-    if (!APPLE_SHARED_SECRET) {
-      return res.status(500).json({ ok: false, error: 'APPLE_SHARED_SECRET_not_set' });
-    }
-
+ 
     let codeEnt = { pro: false, accessUntil: null };
     try {
       if (userId && CODE_PEPPER && codesStore) {
