@@ -434,15 +434,20 @@ function normalizeAppleReceiptPayload({ receiptJson, requestedProductId }) {
 async function verifyAppleReceiptWithFallback(receipt) {
   const f = await getFetch();
 
-  const postToApple = async (url) => {
-    const resp = await f(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        'receipt-data': receipt,
-        'exclude-old-transactions': false,
-      }),
-    });
+const postToApple = async (url) => {
+  console.log('[IAP][APPLE][REQ_META]', {
+    sendsPassword: false,
+    receiptLength: receipt?.length || 0,
+  });
+
+  const resp = await f(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      'receipt-data': receipt,
+      'exclude-old-transactions': false,
+    }),
+  });
 
     const text = await resp.text();
     let json = null;
@@ -947,6 +952,14 @@ app.get('/', (req, res) => {
     codesEnabled: !!CODE_PEPPER,
     codesStore: codesStore?.kind || null,
     adminEnabled: !!ADMIN_KEY,
+  });
+});
+
+app.get('/version', (req, res) => {
+  res.json({
+    version: 'apple-no-password-v2',
+    secretConfigured: !!process.env.APPLE_SHARED_SECRET,
+    time: new Date().toISOString(),
   });
 });
 
