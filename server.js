@@ -1,5 +1,5 @@
 // server.js
-//
+///
 // Google Play subscription verifier + Apple subscription verifier
 // + Partner/School access codes + Mini Admin (browser)
 // + Grace-period cache (do not drop Pro on temporary failures)
