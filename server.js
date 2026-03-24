@@ -56,6 +56,8 @@ const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 const crypto = require('crypto');
 
+console.log('🔥 SERVER BUILD: apple-no-password-v2');
+
 const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
 
