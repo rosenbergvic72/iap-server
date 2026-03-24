@@ -436,20 +436,16 @@ function normalizeAppleReceiptPayload({ receiptJson, requestedProductId }) {
 async function verifyAppleReceiptWithFallback(receipt) {
   const f = await getFetch();
 
-const postToApple = async (url) => {
-  console.log('[IAP][APPLE][REQ_META]', {
-    sendsPassword: false,
-    receiptLength: receipt?.length || 0,
-  });
-
-  const resp = await f(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      'receipt-data': receipt,
-      'exclude-old-transactions': false,
-    }),
-  });
+  const postToApple = async (url) => {
+    const resp = await f(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        'receipt-data': receipt,
+        password: APPLE_SHARED_SECRET,
+        'exclude-old-transactions': false,
+      }),
+    });
 
     const text = await resp.text();
     let json = null;
@@ -1735,6 +1731,10 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
     if (!effectiveReceipt) {
       return res.status(400).json({ ok: false, error: 'receipt_required' });
     }
+
+    if (!APPLE_SHARED_SECRET) {
+  return res.status(500).json({ ok: false, error: 'APPLE_SHARED_SECRET_not_set' });
+}
  
     let codeEnt = { pro: false, accessUntil: null };
     try {
