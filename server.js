@@ -56,8 +56,6 @@ const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 const crypto = require('crypto');
 
-console.log('🔥 SERVER BUILD: apple-no-password-v2');
-
 const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
 
@@ -94,6 +92,8 @@ const GRACE_PERIOD_MS = Math.max(0, GRACE_PERIOD_HOURS) * 60 * 60 * 1000;
 
 const CODE_PEPPER = process.env.CODE_PEPPER || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+const IOS_EMERGENCY_GRACE = String(process.env.IOS_EMERGENCY_GRACE ?? '0') === '1';
 
 // -------------------- CORS --------------------
 app.use((req, res, next) => {
@@ -963,6 +963,44 @@ async function tryGraceEntitlement({ userId }) {
   };
 }
 
+async function tryIosEmergencyGrace({ userId }) {
+  if (!IOS_EMERGENCY_GRACE) return { ok: false, reason: 'disabled' };
+  if (!userId) return { ok: false, reason: 'no_user' };
+
+  const gr = await tryGraceEntitlement({ userId });
+  if (!gr?.ok) return { ok: false, reason: gr?.reason || 'no_cache' };
+
+  const cached = gr.cached || {};
+  if (cached.platform && cached.platform !== 'ios') {
+    return { ok: false, reason: 'not_ios_cache' };
+  }
+
+  if (!cached.expiresAtISO && !cached.lastOkAtISO) {
+    return { ok: false, reason: 'empty_cache' };
+  }
+
+  return {
+    ok: true,
+    reason: gr.reason || 'ios_emergency_grace',
+    response: {
+      ok: true,
+      platform: 'ios',
+      source: 'ios_emergency_grace',
+      pro: true,
+      entitled: true,
+      finalEntitled: true,
+      notExpired: isNotExpired(cached.expiresAtISO),
+      expiresAt: cached.expiresAtISO || null,
+      cachedLastOkAt: cached.lastOkAtISO || null,
+      grace: {
+        applied: true,
+        reason: gr.reason || 'ios_emergency_grace',
+        gracePeriodHours: GRACE_PERIOD_HOURS,
+      },
+    },
+  };
+}
+
 // -------------------- Health --------------------
 app.get('/', (req, res) => {
   res.json({
@@ -1525,14 +1563,14 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'packageName_required' });
     }
 
-    let codeEnt = { pro: false, accessUntil: null };
-    try {
-      if (userId && CODE_PEPPER && codesStore) {
-        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
-      }
-    } catch (e) {
-      console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
-    }
+let codeEnt = { pro: false, accessUntil: null };
+try {
+  if (userId && CODE_PEPPER && codesStore) {
+    codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+  }
+} catch (e) {
+  console.warn('[IAP][APPLE] code entitlement read failed (ignored):', e?.message || e);
+}
 
     const publisher = await getAndroidPublisher();
 
@@ -1747,19 +1785,21 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
 
 // -------------------- IAP Verify: Apple --------------------
 app.post('/iap/apple/subscription/verify', async (req, res) => {
-  const startedAt = Date.now();
-
   try {
-    if (!requireApiKeyIfSet(req, res)) return;
+    const {
+      receipt,
+      purchaseToken,
+      userId,
+      productId,
+    } = req.body || {};
 
-    const { userId, productId, receipt, purchaseToken } = req.body || {};
-    const effectiveReceipt = receipt || purchaseToken || null;
+    const effectiveReceipt = receipt || purchaseToken || '';
 
     console.log('[IAP][APPLE][VERIFY][INPUT]', {
       userId: userId || null,
       productId: productId || null,
       receipt_present: !!effectiveReceipt,
-      receipt_length: effectiveReceipt?.length || 0,
+      receipt_length: effectiveReceipt ? String(effectiveReceipt).length : 0,
     });
 
     if (!effectiveReceipt) {
@@ -1767,54 +1807,44 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
     }
 
     if (!APPLE_SHARED_SECRET) {
-  return res.status(500).json({ ok: false, error: 'APPLE_SHARED_SECRET_not_set' });
-}
- 
+      return res.status(500).json({ ok: false, error: 'APPLE_SHARED_SECRET_not_set' });
+    }
+
     let codeEnt = { pro: false, accessUntil: null };
     try {
-      if (userId && CODE_PEPPER && codesStore) {
-        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
-      }
+      if (userId) codeEnt = await getCodeEntitlement(userId);
     } catch (e) {
-      console.warn('[CODES] entitlement check failed (ignored):', e?.message || e);
+      console.warn('[IAP][APPLE] code entitlement read failed (ignored):', e?.message || e);
     }
 
+    const started = Date.now();
     const appleResp = await verifyAppleReceiptWithFallback(effectiveReceipt);
 
-    console.log('[IAP][APPLE][RAW_STATUS]', {
-      env: appleResp?.env || null,
-      httpStatus: appleResp?.status || null,
-      appleStatus: appleResp?.json?.status ?? null,
-    });
+    if (!appleResp?.json) {
+      const emergency = await tryIosEmergencyGrace({ userId });
+      if (emergency?.ok) {
+        return res.json(emergency.response);
+      }
 
-    if (!appleResp?.json || typeof appleResp.json.status === 'undefined') {
-      throw new Error('apple_verify_bad_response');
+      const grace = await tryGraceEntitlement({ userId });
+      if (grace?.ok) {
+        return res.json(grace.response);
+      }
+
+      return res.status(502).json({ ok: false, error: 'apple_verify_invalid_json' });
     }
 
-    // Apple status 0 = valid
-    if (appleResp.json.status !== 0) {
-      const combined = combineWithCodeEntitlement({ storeEntitled: false, codeEnt });
+if (appleResp.json.status !== 0) {
+  const emergency = await tryIosEmergencyGrace({ userId });
+  if (emergency?.ok) {
+    return res.json(emergency.response);
+  }
 
-      return res.json({
-        ok: true,
-        platform: 'ios',
-        userId: userId || null,
-        productId: productId || null,
-        source: combined.source,
-        codeAccessUntil: combined.codeAccessUntil,
-        pro: combined.finalEntitled,
-        entitled: combined.finalEntitled,
-        notExpired: false,
-        isAcked: null,
-        ack: { tried: false, ok: false, reason: null },
-        appleStatus: appleResp.json.status,
-        grace: { applied: false, reason: null },
-      });
-    }
+  const grace = await tryGraceEntitlement({ userId });
+  if (grace?.ok) {
+    return res.json(grace.response);
+  }
 
-    const latest = pickLatestAppleSubscriptionItem(appleResp.json, productId);
-
-if (!latest) {
   const combined = combineWithCodeEntitlement({
     storeEntitled: false,
     codeEnt,
@@ -1826,11 +1856,11 @@ if (!latest) {
     userId: userId || null,
     productId: productId || null,
     env: appleResp.env || null,
-    appleStatus: 0,
+    appleStatus: appleResp.json.status,
     pro: combined.finalEntitled,
     entitled: combined.finalEntitled,
     entitled_iap: false,
-    entitled_code: !!codeEnt.pro,
+    entitled_code: combined.codeEntitled,
     codeAccessUntil: combined.codeAccessUntil,
     finalEntitled: combined.finalEntitled,
     notExpired: false,
@@ -1841,153 +1871,147 @@ if (!latest) {
   });
 }
 
-const expiresMs = Number(latest?.expires_date_ms || 0);
-const cancellationDate = latest?.cancellation_date || null;
-const notExpired = Number.isFinite(expiresMs) && expiresMs > Date.now();
-const storeEntitled = notExpired;
-const expiresAt = Number.isFinite(expiresMs) && expiresMs > 0
-  ? new Date(expiresMs).toISOString()
-  : null;
+    const latest = pickLatestAppleSubscriptionItem(appleResp.json, productId);
 
-const pendingRenewalInfo = Array.isArray(appleResp?.json?.pending_renewal_info)
-  ? appleResp.json.pending_renewal_info
-  : [];
+    if (!latest) {
+      const emergency = await tryIosEmergencyGrace({ userId });
+      if (emergency?.ok) {
+        return res.json(emergency.response);
+      }
 
-let renewalInfo = null;
-if (productId) {
-  renewalInfo =
-    pendingRenewalInfo.find(
-      (x) => String(x?.product_id || '') === String(productId)
-    ) || null;
-}
-if (!renewalInfo) {
-  renewalInfo =
-    pendingRenewalInfo.find(
-      (x) => String(x?.product_id || '') === String(latest?.product_id || '')
-    ) || null;
-}
+      const combined = combineWithCodeEntitlement({
+        storeEntitled: false,
+        codeEnt,
+      });
 
-const autoRenewStatus = String(renewalInfo?.auto_renew_status || '');
-const willRenew = autoRenewStatus === '1';
+      return res.json({
+        ok: true,
+        platform: 'ios',
+        userId: userId || null,
+        productId: productId || null,
+        env: appleResp.env || null,
+        appleStatus: 0,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        entitled_iap: false,
+        entitled_code: combined.codeEntitled,
+        codeAccessUntil: combined.codeAccessUntil,
+        finalEntitled: combined.finalEntitled,
+        notExpired: false,
+        willRenew: false,
+        cancellationDate: null,
+        expiresAt: null,
+        grace: { applied: false, reason: null },
+      });
+    }
 
+    const expiresMs = Number(latest?.expires_date_ms || 0);
+    const cancellationDate = latest?.cancellation_date || null;
+    const notExpired = Number.isFinite(expiresMs) && expiresMs > Date.now();
+    const storeEntitled = notExpired && !cancellationDate;
+    const expiresAt = Number.isFinite(expiresMs) && expiresMs > 0
+      ? new Date(expiresMs).toISOString()
+      : null;
+
+    const pendingRenewalInfo = Array.isArray(appleResp?.json?.pending_renewal_info)
+      ? appleResp.json.pending_renewal_info
+      : [];
+
+    let renewalInfo = null;
+    if (productId) {
+      renewalInfo =
+        pendingRenewalInfo.find(
+          (x) => String(x?.product_id || '') === String(productId)
+        ) || null;
+    }
+    if (!renewalInfo) {
+      renewalInfo =
+        pendingRenewalInfo.find(
+          (x) => String(x?.product_id || '') === String(latest?.product_id || '')
+        ) || null;
+    }
+
+    const autoRenewStatus = String(renewalInfo?.auto_renew_status || '');
+    const willRenew = autoRenewStatus === '1';
+
+    const combined = combineWithCodeEntitlement({
+      storeEntitled,
+      codeEnt,
+    });
 
     try {
-      if (userId && iapCache && expiresAt) {
-  await iapCache.put({
-    userId: String(userId),
-    packageName: null,
-    productId: latest?.product_id || productId || null,
-    platform: 'ios',
-    expiresAtISO: expiresAt,
-    isAcked: true,
-  });
-}
+      if (userId) {
+        await writeGraceCache({
+          userId,
+          platform: 'ios',
+          packageName: null,
+          productId: latest?.product_id || productId || null,
+          expiresAtISO: expiresAt,
+          lastOkAtISO: new Date().toISOString(),
+          isAcked: true,
+        });
+      }
     } catch (e) {
       console.warn('[IAP][GRACE][APPLE] cache write failed (ignored):', e?.message || e);
     }
 
-    const combined = combineWithCodeEntitlement({ storeEntitled, codeEnt });
-
-  console.log('[IAP][APPLE] verify', {
-  ms: Date.now() - startedAt,
-  userId: userId || null,
-  productId: latest?.product_id || productId || null,
-  env: appleResp.env || null,
-  expiresAt,
-  notExpired,
-  willRenew,
-  cancellationDate,
-  entitled_iap: storeEntitled,
-  entitled_code: !!codeEnt.pro,
-  finalEntitled: combined.finalEntitled,
-});
-
-  return res.json({
-  ok: true,
-  platform: 'ios',
-  userId: userId || null,
-  productId: latest?.product_id || productId || null,
-  source: combined.source,
-  codeAccessUntil: combined.codeAccessUntil,
-  pro: combined.finalEntitled,
-  entitled: combined.finalEntitled,
-  expiresAt,
-  notExpired,
-  willRenew,
-  cancellationDate,
-  appleStatus: 0,
-  isAcked: true,
-  ack: { tried: false, ok: true, reason: 'apple-receipt-verified' },
-  usedVersion: appleResp.env || 'apple',
-  grace: { applied: false, reason: null },
-});
-  } catch (err) {
-    const msg = err?.message || 'Unknown error';
-    const userId = req.body?.userId ? String(req.body.userId) : null;
-    const productId = req.body?.productId || null;
-
-    console.error('[IAP][VERIFY][APPLE_ERROR]', {
-      message: msg,
+    console.log('[IAP][APPLE] verify', {
+      ms: Date.now() - started,
+      userId: userId || null,
+      productId: productId || latest?.product_id || null,
+      env: appleResp.env || null,
+      expiresAt,
+      notExpired,
+      willRenew,
+      cancellationDate,
+      entitled_iap: storeEntitled,
+      entitled_code: combined.codeEntitled,
+      finalEntitled: combined.finalEntitled,
+      iosEmergencyGrace: IOS_EMERGENCY_GRACE,
     });
 
-    let codeEnt = { pro: false, accessUntil: null };
-    try {
-      if (userId && CODE_PEPPER && codesStore) {
-        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
-      }
-    } catch {}
+    return res.json({
+      ok: true,
+      platform: 'ios',
+      userId: userId || null,
+      productId: latest?.product_id || productId || null,
+      env: appleResp.env || null,
+      appleStatus: 0,
 
-    // For Apple we treat transport/temporary receipt verification failures similarly:
-    // allow grace only if cached entitlement exists and is still not expired.
-    try {
-      const gr = await tryGraceEntitlement({ userId });
-      const combined = combineWithCodeEntitlement({ storeEntitled: !!gr.ok, codeEnt });
+      expiresAt,
+      notExpired,
+      willRenew,
+      cancellationDate,
 
-      console.warn('[IAP][GRACE][APPLE] applied?', {
-        userId: userId || null,
-        ok: gr.ok,
-        reason: gr.reason,
-        cachedExpiresAt: gr.cached?.expiresAtISO || null,
-        cachedLastOkAt: gr.cached?.lastOkAtISO || null,
-        entitled_code: !!codeEnt.pro,
-        finalEntitled: combined.finalEntitled,
-      });
+      entitled_iap: storeEntitled,
+      entitled_code: combined.codeEntitled,
+      codeAccessUntil: combined.codeAccessUntil,
+      finalEntitled: combined.finalEntitled,
 
-      if (combined.finalEntitled) {
-        return res.status(200).json({
-          ok: true,
-          platform: 'ios',
-          userId,
-          productId,
-          source: gr.ok ? 'grace_cache' : 'partner_code',
-          codeAccessUntil: codeEnt.accessUntil || null,
-          pro: true,
-          entitled: true,
-          expiresAt: gr.cached?.expiresAtISO || null,
-          notExpired: gr.ok ? true : null,
-          isAcked: true,
-          ack: { tried: false, ok: true, reason: 'grace_mode' },
-          usedVersion: 'grace',
-          grace: {
-            applied: !!gr.ok,
-            reason: gr.reason || null,
-            gracePeriodHours: GRACE_PERIOD_HOURS,
-            cached: gr.cached || null,
-          },
-          appleError: {
-            message: msg,
-          },
-        });
-      }
-    } catch (e) {
-      console.warn('[IAP][GRACE][APPLE] failed (ignored):', e?.message || e);
+      pro: combined.finalEntitled,
+      entitled: combined.finalEntitled,
+
+      isAcked: true,
+      ack: { tried: false, ok: true, reason: 'ios_not_applicable' },
+      grace: { applied: false, reason: null },
+    });
+  } catch (e) {
+    console.error('[IAP][APPLE] verify fatal error:', e);
+
+    const emergency = await tryIosEmergencyGrace({ userId: req?.body?.userId });
+    if (emergency?.ok) {
+      return res.json(emergency.response);
+    }
+
+    const grace = await tryGraceEntitlement({ userId: req?.body?.userId });
+    if (grace?.ok) {
+      return res.json(grace.response);
     }
 
     return res.status(500).json({
       ok: false,
-      error: msg,
-      graceApplicable: true,
-      gracePeriodHours: GRACE_PERIOD_HOURS,
+      error: 'apple_verify_failed',
+      details: e?.message || String(e),
     });
   }
 });
