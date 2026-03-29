@@ -1812,13 +1812,50 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
 
     let codeEnt = { pro: false, accessUntil: null };
     try {
-      if (userId) codeEnt = await getCodeEntitlement(userId);
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
     } catch (e) {
       console.warn('[IAP][APPLE] code entitlement read failed (ignored):', e?.message || e);
     }
 
     const started = Date.now();
     const appleResp = await verifyAppleReceiptWithFallback(effectiveReceipt);
+
+    const makeGraceResponse = ({ gr, codeEnt, userId, productId, env = null, appleStatus = null }) => {
+      const combined = combineWithCodeEntitlement({
+        storeEntitled: !!gr?.ok,
+        codeEnt,
+      });
+
+      return {
+        ok: true,
+        platform: 'ios',
+        userId: userId || null,
+        productId: productId || null,
+        env,
+        appleStatus,
+        source: gr?.ok ? 'grace_cache' : (codeEnt?.pro ? 'partner_code' : null),
+        codeAccessUntil: codeEnt?.accessUntil || null,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        entitled_iap: !!gr?.ok,
+        entitled_code: !!codeEnt?.pro,
+        finalEntitled: combined.finalEntitled,
+        notExpired: gr?.ok ? true : false,
+        willRenew: false,
+        cancellationDate: null,
+        expiresAt: gr?.cached?.expiresAtISO || null,
+        isAcked: gr?.ok ? gr?.cached?.isAcked === true : true,
+        ack: { tried: false, ok: !!gr?.ok, reason: gr?.ok ? 'grace_mode' : 'ios_not_applicable' },
+        grace: {
+          applied: !!gr?.ok,
+          reason: gr?.reason || null,
+          gracePeriodHours: GRACE_PERIOD_HOURS,
+          cached: gr?.cached || null,
+        },
+      };
+    };
 
     if (!appleResp?.json) {
       const emergency = await tryIosEmergencyGrace({ userId });
@@ -1828,48 +1865,96 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
 
       const grace = await tryGraceEntitlement({ userId });
       if (grace?.ok) {
-        return res.json(grace.response);
+        return res.json(
+          makeGraceResponse({
+            gr: grace,
+            codeEnt,
+            userId,
+            productId,
+            env: null,
+            appleStatus: null,
+          })
+        );
       }
 
-      return res.status(502).json({ ok: false, error: 'apple_verify_invalid_json' });
+      const combined = combineWithCodeEntitlement({
+        storeEntitled: false,
+        codeEnt,
+      });
+
+      return res.status(502).json({
+        ok: true,
+        platform: 'ios',
+        userId: userId || null,
+        productId: productId || null,
+        env: null,
+        appleStatus: null,
+        source: combined.source,
+        codeAccessUntil: combined.codeAccessUntil,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        entitled_iap: false,
+        entitled_code: !!codeEnt.pro,
+        finalEntitled: combined.finalEntitled,
+        notExpired: false,
+        willRenew: false,
+        cancellationDate: null,
+        expiresAt: null,
+        isAcked: true,
+        ack: { tried: false, ok: true, reason: 'ios_not_applicable' },
+        grace: { applied: false, reason: null },
+        error: 'apple_verify_invalid_json',
+      });
     }
 
-if (appleResp.json.status !== 0) {
-  const emergency = await tryIosEmergencyGrace({ userId });
-  if (emergency?.ok) {
-    return res.json(emergency.response);
-  }
+    if (appleResp.json.status !== 0) {
+      const emergency = await tryIosEmergencyGrace({ userId });
+      if (emergency?.ok) {
+        return res.json(emergency.response);
+      }
 
-  const grace = await tryGraceEntitlement({ userId });
-  if (grace?.ok) {
-    return res.json(grace.response);
-  }
+      const grace = await tryGraceEntitlement({ userId });
+      if (grace?.ok) {
+        return res.json(
+          makeGraceResponse({
+            gr: grace,
+            codeEnt,
+            userId,
+            productId,
+            env: appleResp.env || null,
+            appleStatus: appleResp.json.status,
+          })
+        );
+      }
 
-  const combined = combineWithCodeEntitlement({
-    storeEntitled: false,
-    codeEnt,
-  });
+      const combined = combineWithCodeEntitlement({
+        storeEntitled: false,
+        codeEnt,
+      });
 
-  return res.json({
-    ok: true,
-    platform: 'ios',
-    userId: userId || null,
-    productId: productId || null,
-    env: appleResp.env || null,
-    appleStatus: appleResp.json.status,
-    pro: combined.finalEntitled,
-    entitled: combined.finalEntitled,
-    entitled_iap: false,
-    entitled_code: combined.codeEntitled,
-    codeAccessUntil: combined.codeAccessUntil,
-    finalEntitled: combined.finalEntitled,
-    notExpired: false,
-    willRenew: false,
-    cancellationDate: null,
-    expiresAt: null,
-    grace: { applied: false, reason: null },
-  });
-}
+      return res.json({
+        ok: true,
+        platform: 'ios',
+        userId: userId || null,
+        productId: productId || null,
+        env: appleResp.env || null,
+        appleStatus: appleResp.json.status,
+        source: combined.source,
+        codeAccessUntil: combined.codeAccessUntil,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        entitled_iap: false,
+        entitled_code: !!codeEnt.pro,
+        finalEntitled: combined.finalEntitled,
+        notExpired: false,
+        willRenew: false,
+        cancellationDate: null,
+        expiresAt: null,
+        isAcked: true,
+        ack: { tried: false, ok: true, reason: 'ios_not_applicable' },
+        grace: { applied: false, reason: null },
+      });
+    }
 
     const latest = pickLatestAppleSubscriptionItem(appleResp.json, productId);
 
@@ -1877,6 +1962,20 @@ if (appleResp.json.status !== 0) {
       const emergency = await tryIosEmergencyGrace({ userId });
       if (emergency?.ok) {
         return res.json(emergency.response);
+      }
+
+      const grace = await tryGraceEntitlement({ userId });
+      if (grace?.ok) {
+        return res.json(
+          makeGraceResponse({
+            gr: grace,
+            codeEnt,
+            userId,
+            productId,
+            env: appleResp.env || null,
+            appleStatus: 0,
+          })
+        );
       }
 
       const combined = combineWithCodeEntitlement({
@@ -1891,27 +1990,33 @@ if (appleResp.json.status !== 0) {
         productId: productId || null,
         env: appleResp.env || null,
         appleStatus: 0,
+        source: combined.source,
+        codeAccessUntil: combined.codeAccessUntil,
         pro: combined.finalEntitled,
         entitled: combined.finalEntitled,
         entitled_iap: false,
-        entitled_code: combined.codeEntitled,
-        codeAccessUntil: combined.codeAccessUntil,
+        entitled_code: !!codeEnt.pro,
         finalEntitled: combined.finalEntitled,
         notExpired: false,
         willRenew: false,
         cancellationDate: null,
         expiresAt: null,
+        isAcked: true,
+        ack: { tried: false, ok: true, reason: 'ios_not_applicable' },
         grace: { applied: false, reason: null },
       });
     }
 
     const expiresMs = Number(latest?.expires_date_ms || 0);
-    const cancellationDate = latest?.cancellation_date || null;
+    const cancellationDate = isoOrNull(
+      latest?.cancellation_date_ms || latest?.cancellation_date || null
+    );
     const notExpired = Number.isFinite(expiresMs) && expiresMs > Date.now();
     const storeEntitled = notExpired && !cancellationDate;
-    const expiresAt = Number.isFinite(expiresMs) && expiresMs > 0
-      ? new Date(expiresMs).toISOString()
-      : null;
+    const expiresAt =
+      Number.isFinite(expiresMs) && expiresMs > 0
+        ? new Date(expiresMs).toISOString()
+        : null;
 
     const pendingRenewalInfo = Array.isArray(appleResp?.json?.pending_renewal_info)
       ? appleResp.json.pending_renewal_info
@@ -1940,14 +2045,13 @@ if (appleResp.json.status !== 0) {
     });
 
     try {
-      if (userId) {
-        await writeGraceCache({
-          userId,
-          platform: 'ios',
+      if (userId && iapCache) {
+        await iapCache.put({
+          userId: String(userId),
           packageName: null,
           productId: latest?.product_id || productId || null,
-          expiresAtISO: expiresAt,
-          lastOkAtISO: new Date().toISOString(),
+          platform: 'ios',
+          expiresAtISO: expiresAt || null,
           isAcked: true,
         });
       }
@@ -1958,14 +2062,14 @@ if (appleResp.json.status !== 0) {
     console.log('[IAP][APPLE] verify', {
       ms: Date.now() - started,
       userId: userId || null,
-      productId: productId || latest?.product_id || null,
+      productId: latest?.product_id || productId || null,
       env: appleResp.env || null,
       expiresAt,
       notExpired,
       willRenew,
       cancellationDate,
       entitled_iap: storeEntitled,
-      entitled_code: combined.codeEntitled,
+      entitled_code: !!codeEnt.pro,
       finalEntitled: combined.finalEntitled,
       iosEmergencyGrace: IOS_EMERGENCY_GRACE,
     });
@@ -1977,6 +2081,8 @@ if (appleResp.json.status !== 0) {
       productId: latest?.product_id || productId || null,
       env: appleResp.env || null,
       appleStatus: 0,
+      source: combined.source,
+      codeAccessUntil: combined.codeAccessUntil,
 
       expiresAt,
       notExpired,
@@ -1984,8 +2090,7 @@ if (appleResp.json.status !== 0) {
       cancellationDate,
 
       entitled_iap: storeEntitled,
-      entitled_code: combined.codeEntitled,
-      codeAccessUntil: combined.codeAccessUntil,
+      entitled_code: !!codeEnt.pro,
       finalEntitled: combined.finalEntitled,
 
       pro: combined.finalEntitled,
@@ -1998,14 +2103,54 @@ if (appleResp.json.status !== 0) {
   } catch (e) {
     console.error('[IAP][APPLE] verify fatal error:', e);
 
-    const emergency = await tryIosEmergencyGrace({ userId: req?.body?.userId });
+    const bodyUserId = req?.body?.userId ? String(req.body.userId) : null;
+
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (bodyUserId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: bodyUserId });
+      }
+    } catch {}
+
+    const emergency = await tryIosEmergencyGrace({ userId: bodyUserId });
     if (emergency?.ok) {
       return res.json(emergency.response);
     }
 
-    const grace = await tryGraceEntitlement({ userId: req?.body?.userId });
+    const grace = await tryGraceEntitlement({ userId: bodyUserId });
     if (grace?.ok) {
-      return res.json(grace.response);
+      const combined = combineWithCodeEntitlement({
+        storeEntitled: true,
+        codeEnt,
+      });
+
+      return res.json({
+        ok: true,
+        platform: 'ios',
+        userId: bodyUserId,
+        productId: req?.body?.productId || null,
+        env: null,
+        appleStatus: null,
+        source: 'grace_cache',
+        codeAccessUntil: codeEnt?.accessUntil || null,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        entitled_iap: true,
+        entitled_code: !!codeEnt?.pro,
+        finalEntitled: combined.finalEntitled,
+        notExpired: true,
+        willRenew: false,
+        cancellationDate: null,
+        expiresAt: grace?.cached?.expiresAtISO || null,
+        isAcked: grace?.cached?.isAcked === true,
+        ack: { tried: false, ok: true, reason: 'grace_mode' },
+        grace: {
+          applied: true,
+          reason: grace?.reason || null,
+          gracePeriodHours: GRACE_PERIOD_HOURS,
+          cached: grace?.cached || null,
+        },
+      });
     }
 
     return res.status(500).json({
