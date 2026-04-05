@@ -168,6 +168,25 @@ function combineWithCodeEntitlement({ storeEntitled, codeEnt }) {
   };
 }
 
+function logAccessEvent(tag, payload = {}) {
+  console.log(tag, {
+    userId: payload.userId || null,
+    platform: payload.platform || null,
+    packageName: payload.packageName || null,
+    productId: payload.productId || null,
+    route: payload.route || null,
+    source: payload.source || null,
+    entitled_iap: !!payload.entitled_iap,
+    entitled_code: !!payload.entitled_code,
+    finalEntitled: !!payload.finalEntitled,
+    codeAccessUntil: payload.codeAccessUntil || null,
+    cachedExpiresAt: payload.cachedExpiresAt || null,
+    cachedNotExpired: !!payload.cachedNotExpired,
+    isProbe: !!payload.isProbe,
+    note: payload.note || null,
+  });
+}
+
 // -------------------- Google Auth (robust like old server) --------------------
 // If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
 // materialize a local file so GoogleAuth can read it (helps on hosts like Render).
@@ -1460,6 +1479,17 @@ app.post('/redeem/code', async (req, res) => {
       return res.status(status).json({ ok: false, error: out.error });
     }
 
+        logAccessEvent('[ACCESS][CODE][REDEEM]', {
+      userId: String(userId),
+      platform: 'codes',
+      route: '/redeem/code',
+      source: 'partner_code',
+      entitled_code: true,
+      finalEntitled: true,
+      codeAccessUntil: out.accessUntil,
+      note: 'code redeemed successfully',
+    });
+
     return res.json({
       ok: true,
       pro: true,
@@ -1482,11 +1512,46 @@ app.get('/entitlements', async (req, res) => {
     const userId = String(req.query?.userId || '').trim();
     if (!userId) return res.status(400).json({ ok: false, error: 'userId_required' });
 
+    logAccessEvent('[ACCESS][ENTITLEMENTS][INPUT]', {
+      userId,
+      platform: 'codes',
+      route: '/entitlements',
+      source: 'entitlements_lookup',
+      note: 'incoming entitlements request',
+    });
+
     if (!CODE_PEPPER || !codesStore) {
-      return res.json({ ok: true, pro: false, entitled: false, source: null, accessUntil: null });
+      logAccessEvent('[ACCESS][ENTITLEMENTS][RESULT]', {
+        userId,
+        platform: 'codes',
+        route: '/entitlements',
+        source: null,
+        entitled_code: false,
+        finalEntitled: false,
+        note: 'codes disabled or store not ready',
+      });
+
+      return res.json({
+        ok: true,
+        pro: false,
+        entitled: false,
+        source: null,
+        accessUntil: null,
+      });
     }
 
     const ent = await codesStore.getEntitlement({ userId });
+
+    logAccessEvent('[ACCESS][ENTITLEMENTS][RESULT]', {
+      userId,
+      platform: 'codes',
+      route: '/entitlements',
+      source: ent.pro ? 'partner_code' : null,
+      entitled_code: !!ent.pro,
+      finalEntitled: !!ent.pro,
+      codeAccessUntil: ent.accessUntil || null,
+    });
+
     return res.json({
       ok: true,
       pro: !!ent.pro,
@@ -1512,6 +1577,16 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
 
     const isProbe = !purchaseToken;
 
+        logAccessEvent('[ACCESS][GOOGLE][INPUT]', {
+      userId: userId || null,
+      platform: 'android',
+      packageName: pkg || null,
+      productId: productId || null,
+      route: '/iap/google/subscription/verify',
+      isProbe,
+      note: 'incoming google verify request',
+    });
+
 if (isProbe) {
   let codeEnt = { pro: false, accessUntil: null };
   try {
@@ -1529,11 +1604,10 @@ if (isProbe) {
 
   const cachedNotExpired = cached?.expiresAtISO ? isNotExpired(cached.expiresAtISO) : false;
 
-  const combined = {
-    finalEntitled: false,
-    source: null,
-    codeAccessUntil: codeEnt?.accessUntil || null,
-  };
+const combined = combineWithCodeEntitlement({
+    storeEntitled: false,
+    codeEnt,
+  });
 
   console.log('[IAP][GOOGLE][PROBE]', {
     userId: userId || null,
@@ -1546,19 +1620,35 @@ if (isProbe) {
     finalEntitled: combined.finalEntitled,
   });
 
+    logAccessEvent('[ACCESS][GOOGLE][PROBE]', {
+    userId: userId || null,
+    platform: 'android',
+    packageName: pkg || null,
+    productId: productId || null,
+    route: '/iap/google/subscription/verify',
+    source: combined.source,
+    entitled_iap: false,
+    entitled_code: !!codeEnt.pro,
+    finalEntitled: combined.finalEntitled,
+    codeAccessUntil: combined.codeAccessUntil,
+    cachedExpiresAt: cached?.expiresAtISO || null,
+    cachedNotExpired,
+    isProbe: true,
+  });
+
   return res.json({
     ok: true,
     platform: 'android',
     packageName: pkg || null,
     userId: userId || null,
     productId: productId || null,
-    source: combined.source,
+        source: combined.source,
     codeAccessUntil: combined.codeAccessUntil,
-    pro: false,
-    entitled: false,
+    pro: combined.finalEntitled,
+    entitled: combined.finalEntitled,
     entitled_iap: false,
     entitled_code: !!codeEnt.pro,
-    finalEntitled: false,
+    finalEntitled: combined.finalEntitled,
     probe: true,
     cachedExpiresAt: cached?.expiresAtISO || null,
     cachedNotExpired,
@@ -1705,6 +1795,20 @@ try {
       ackError: ack.error || null,
     });
 
+        logAccessEvent('[ACCESS][GOOGLE][RESULT]', {
+      userId: userId || null,
+      platform: 'android',
+      packageName: pkg || null,
+      productId: productId || null,
+      route: '/iap/google/subscription/verify',
+      source: combined.source,
+      entitled_iap: !!entitled,
+      entitled_code: !!codeEnt.pro,
+      finalEntitled: combined.finalEntitled,
+      codeAccessUntil: combined.codeAccessUntil,
+      isProbe: false,
+    });
+
     return res.json({
       ok: true,
       platform: 'android',
@@ -1760,6 +1864,23 @@ try {
           cachedLastOkAt: gr.cached?.lastOkAtISO || null,
           entitled_code: !!codeEnt.pro,
           finalEntitled: combined.finalEntitled,
+        });
+
+                logAccessEvent('[ACCESS][GOOGLE][GRACE]', {
+          userId: userId || null,
+          platform: 'android',
+          packageName: pkg || null,
+          productId: productId || null,
+          route: '/iap/google/subscription/verify',
+          source: gr.ok ? 'grace_cache' : (codeEnt.pro ? 'partner_code' : null),
+          entitled_iap: !!gr.ok,
+          entitled_code: !!codeEnt.pro,
+          finalEntitled: combined.finalEntitled,
+          codeAccessUntil: codeEnt.accessUntil || null,
+          cachedExpiresAt: gr.cached?.expiresAtISO || null,
+          cachedNotExpired: gr.cached?.expiresAtISO ? isNotExpired(gr.cached.expiresAtISO) : false,
+          isProbe: false,
+          note: gr.reason || 'grace branch',
         });
 
         if (combined.finalEntitled) {
