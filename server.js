@@ -1510,6 +1510,62 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     const { userId, productId, packageName, purchaseToken } = req.body || {};
     const pkg = packageName || PACKAGE_NAME;
 
+    const isProbe = !purchaseToken;
+
+if (isProbe) {
+  let codeEnt = { pro: false, accessUntil: null };
+  try {
+    if (userId && CODE_PEPPER && codesStore) {
+      codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+    }
+  } catch (e) {
+    console.warn('[IAP][GOOGLE][PROBE] code entitlement read failed (ignored):', e?.message || e);
+  }
+
+  let cached = null;
+  try {
+    if (userId && iapCache) cached = await iapCache.get(String(userId));
+  } catch {}
+
+  const cachedNotExpired = cached?.expiresAtISO ? isNotExpired(cached.expiresAtISO) : false;
+
+  const combined = {
+    finalEntitled: false,
+    source: null,
+    codeAccessUntil: codeEnt?.accessUntil || null,
+  };
+
+  console.log('[IAP][GOOGLE][PROBE]', {
+    userId: userId || null,
+    packageName: pkg || null,
+    productId: productId || null,
+    entitled_code: !!codeEnt.pro,
+    codeAccessUntil: codeEnt.accessUntil || null,
+    cachedExpiresAt: cached?.expiresAtISO || null,
+    cachedNotExpired,
+    finalEntitled: combined.finalEntitled,
+  });
+
+  return res.json({
+    ok: true,
+    platform: 'android',
+    packageName: pkg || null,
+    userId: userId || null,
+    productId: productId || null,
+    source: combined.source,
+    codeAccessUntil: combined.codeAccessUntil,
+    pro: false,
+    entitled: false,
+    entitled_iap: false,
+    entitled_code: !!codeEnt.pro,
+    finalEntitled: false,
+    probe: true,
+    cachedExpiresAt: cached?.expiresAtISO || null,
+    cachedNotExpired,
+    grace: { applied: false, reason: 'probe_only' },
+  });
+}
+
     console.log('[IAP][GOOGLE][VERIFY][INPUT]', {
       userId: userId || null,
       productId: productId || null,
