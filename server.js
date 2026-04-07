@@ -173,7 +173,7 @@ function logSummary(payload = {}) {
     userId: payload.userId || null,
     platform: payload.platform || null,
     source: payload.source || null,
-    pro: !!payload.pro,
+    pro: typeof payload.pro === 'boolean' ? payload.pro : null,
     expiresAt: payload.expiresAt || null,
     codeAccessUntil: payload.codeAccessUntil || null,
     productId: payload.productId || null,
