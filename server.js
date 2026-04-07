@@ -1003,6 +1003,29 @@ app.get('/', (req, res) => {
   });
 });
 
+// -------------------- Access Ping --------------------
+app.post('/access/ping', async (req, res) => {
+  try {
+    const { userId, platform } = req.body || {};
+
+    logSummary({
+      userId: userId || null,
+      platform: platform || null,
+      source: 'ping',
+      pro: null,
+      expiresAt: null,
+      codeAccessUntil: null,
+      productId: null,
+      route: '/access/ping',
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[PING] error:', e);
+    return res.status(500).json({ ok: false });
+  }
+});
+
 app.get('/version', (req, res) => {
   res.json({
     version: 'apple-receipt-centric-v1',
