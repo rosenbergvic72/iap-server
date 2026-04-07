@@ -168,24 +168,19 @@ function combineWithCodeEntitlement({ storeEntitled, codeEnt }) {
   };
 }
 
-function logAccessEvent(tag, payload = {}) {
-  console.log(tag, {
+function logSummary(payload = {}) {
+  console.log('[ACCESS][SUMMARY]', {
     userId: payload.userId || null,
     platform: payload.platform || null,
-    packageName: payload.packageName || null,
+    source: payload.source || null,
+    pro: !!payload.pro,
+    expiresAt: payload.expiresAt || null,
+    codeAccessUntil: payload.codeAccessUntil || null,
     productId: payload.productId || null,
     route: payload.route || null,
-    source: payload.source || null,
-    entitled_iap: !!payload.entitled_iap,
-    entitled_code: !!payload.entitled_code,
-    finalEntitled: !!payload.finalEntitled,
-    codeAccessUntil: payload.codeAccessUntil || null,
-    cachedExpiresAt: payload.cachedExpiresAt || null,
-    cachedNotExpired: !!payload.cachedNotExpired,
-    isProbe: !!payload.isProbe,
-    note: payload.note || null,
   });
 }
+
 
 // -------------------- Google Auth (robust like old server) --------------------
 // If GOOGLE_APPLICATION_CREDENTIALS is not set but SERVICE_ACCOUNT_JSON is,
@@ -1479,16 +1474,16 @@ app.post('/redeem/code', async (req, res) => {
       return res.status(status).json({ ok: false, error: out.error });
     }
 
-        logAccessEvent('[ACCESS][CODE][REDEEM]', {
-      userId: String(userId),
-      platform: 'codes',
-      route: '/redeem/code',
-      source: 'partner_code',
-      entitled_code: true,
-      finalEntitled: true,
-      codeAccessUntil: out.accessUntil,
-      note: 'code redeemed successfully',
-    });
+ logSummary({
+  userId: String(userId),
+  platform: 'codes',
+  source: 'code',
+  pro: true,
+  expiresAt: null,
+  codeAccessUntil: out.accessUntil,
+  productId: null,
+  route: '/redeem/code',
+});
 
     return res.json({
       ok: true,
@@ -1512,23 +1507,16 @@ app.get('/entitlements', async (req, res) => {
     const userId = String(req.query?.userId || '').trim();
     if (!userId) return res.status(400).json({ ok: false, error: 'userId_required' });
 
-    logAccessEvent('[ACCESS][ENTITLEMENTS][INPUT]', {
-      userId,
-      platform: 'codes',
-      route: '/entitlements',
-      source: 'entitlements_lookup',
-      note: 'incoming entitlements request',
-    });
-
     if (!CODE_PEPPER || !codesStore) {
-      logAccessEvent('[ACCESS][ENTITLEMENTS][RESULT]', {
+      logSummary({
         userId,
         platform: 'codes',
+        source: 'free',
+        pro: false,
+        expiresAt: null,
+        codeAccessUntil: null,
+        productId: null,
         route: '/entitlements',
-        source: null,
-        entitled_code: false,
-        finalEntitled: false,
-        note: 'codes disabled or store not ready',
       });
 
       return res.json({
@@ -1542,14 +1530,15 @@ app.get('/entitlements', async (req, res) => {
 
     const ent = await codesStore.getEntitlement({ userId });
 
-    logAccessEvent('[ACCESS][ENTITLEMENTS][RESULT]', {
+    logSummary({
       userId,
       platform: 'codes',
-      route: '/entitlements',
-      source: ent.pro ? 'partner_code' : null,
-      entitled_code: !!ent.pro,
-      finalEntitled: !!ent.pro,
+      source: ent.pro ? 'code' : 'free',
+      pro: !!ent.pro,
+      expiresAt: null,
       codeAccessUntil: ent.accessUntil || null,
+      productId: null,
+      route: '/entitlements',
     });
 
     return res.json({
@@ -1565,106 +1554,66 @@ app.get('/entitlements', async (req, res) => {
   }
 });
 
+
 // -------------------- IAP Verify: Google --------------------
 app.post('/iap/google/subscription/verify', async (req, res) => {
-  const startedAt = Date.now();
-
   try {
     if (!requireApiKeyIfSet(req, res)) return;
 
     const { userId, productId, packageName, purchaseToken } = req.body || {};
     const pkg = packageName || PACKAGE_NAME;
-
     const isProbe = !purchaseToken;
 
-        logAccessEvent('[ACCESS][GOOGLE][INPUT]', {
-      userId: userId || null,
-      platform: 'android',
-      packageName: pkg || null,
-      productId: productId || null,
-      route: '/iap/google/subscription/verify',
-      isProbe,
-      note: 'incoming google verify request',
-    });
+    if (isProbe) {
+      let codeEnt = { pro: false, accessUntil: null };
+      try {
+        if (userId && CODE_PEPPER && codesStore) {
+          codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+        }
+      } catch (e) {
+        console.warn('[IAP][GOOGLE][PROBE] code entitlement read failed (ignored):', e?.message || e);
+      }
 
-if (isProbe) {
-  let codeEnt = { pro: false, accessUntil: null };
-  try {
-    if (userId && CODE_PEPPER && codesStore) {
-      codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
-    }
-  } catch (e) {
-    console.warn('[IAP][GOOGLE][PROBE] code entitlement read failed (ignored):', e?.message || e);
-  }
+      let cached = null;
+      try {
+        if (userId && iapCache) cached = await iapCache.get(String(userId));
+      } catch {}
 
-  let cached = null;
-  try {
-    if (userId && iapCache) cached = await iapCache.get(String(userId));
-  } catch {}
+      const combined = combineWithCodeEntitlement({
+        storeEntitled: false,
+        codeEnt,
+      });
 
-  const cachedNotExpired = cached?.expiresAtISO ? isNotExpired(cached.expiresAtISO) : false;
+      logSummary({
+        userId: userId || null,
+        platform: 'android',
+        source: combined.source || 'free',
+        pro: combined.finalEntitled,
+        expiresAt: cached?.expiresAtISO || null,
+        codeAccessUntil: combined.codeAccessUntil || null,
+        productId: productId || null,
+        route: '/iap/google/subscription/verify:probe',
+      });
 
-const combined = combineWithCodeEntitlement({
-    storeEntitled: false,
-    codeEnt,
-  });
-
-  console.log('[IAP][GOOGLE][PROBE]', {
-    userId: userId || null,
-    packageName: pkg || null,
-    productId: productId || null,
-    entitled_code: !!codeEnt.pro,
-    codeAccessUntil: codeEnt.accessUntil || null,
-    cachedExpiresAt: cached?.expiresAtISO || null,
-    cachedNotExpired,
-    finalEntitled: combined.finalEntitled,
-  });
-
-    logAccessEvent('[ACCESS][GOOGLE][PROBE]', {
-    userId: userId || null,
-    platform: 'android',
-    packageName: pkg || null,
-    productId: productId || null,
-    route: '/iap/google/subscription/verify',
-    source: combined.source,
-    entitled_iap: false,
-    entitled_code: !!codeEnt.pro,
-    finalEntitled: combined.finalEntitled,
-    codeAccessUntil: combined.codeAccessUntil,
-    cachedExpiresAt: cached?.expiresAtISO || null,
-    cachedNotExpired,
-    isProbe: true,
-  });
-
-  return res.json({
-    ok: true,
-    platform: 'android',
-    packageName: pkg || null,
-    userId: userId || null,
-    productId: productId || null,
+      return res.json({
+        ok: true,
+        platform: 'android',
+        packageName: pkg || null,
+        userId: userId || null,
+        productId: productId || null,
         source: combined.source,
-    codeAccessUntil: combined.codeAccessUntil,
-    pro: combined.finalEntitled,
-    entitled: combined.finalEntitled,
-    entitled_iap: false,
-    entitled_code: !!codeEnt.pro,
-    finalEntitled: combined.finalEntitled,
-    probe: true,
-    cachedExpiresAt: cached?.expiresAtISO || null,
-    cachedNotExpired,
-    grace: { applied: false, reason: 'probe_only' },
-  });
-}
-
-    console.log('[IAP][GOOGLE][VERIFY][INPUT]', {
-      userId: userId || null,
-      productId: productId || null,
-      packageName_from_client: packageName || null,
-      packageName_env: PACKAGE_NAME || null,
-      pkg_effective: pkg || null,
-      purchaseToken_masked: purchaseToken ? maskToken(purchaseToken) : null,
-      tokenLength: purchaseToken?.length ?? 0,
-    });
+        codeAccessUntil: combined.codeAccessUntil,
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        entitled_iap: false,
+        entitled_code: !!codeEnt.pro,
+        finalEntitled: combined.finalEntitled,
+        probe: true,
+        cachedExpiresAt: cached?.expiresAtISO || null,
+        cachedNotExpired: cached?.expiresAtISO ? isNotExpired(cached.expiresAtISO) : false,
+        grace: { applied: false, reason: 'probe_only' },
+      });
+    }
 
     if (!purchaseToken) {
       return res.status(400).json({ ok: false, error: 'purchaseToken_required' });
@@ -1673,14 +1622,14 @@ const combined = combineWithCodeEntitlement({
       return res.status(400).json({ ok: false, error: 'packageName_required' });
     }
 
-let codeEnt = { pro: false, accessUntil: null };
-try {
-  if (userId && CODE_PEPPER && codesStore) {
-    codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
-  }
-} catch (e) {
-  console.warn('[IAP][GOOGLE] code entitlement read failed (ignored):', e?.message || e);
-}
+    let codeEnt = { pro: false, accessUntil: null };
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch (e) {
+      console.warn('[IAP][GOOGLE] code entitlement read failed (ignored):', e?.message || e);
+    }
 
     const publisher = await getAndroidPublisher();
 
@@ -1741,7 +1690,9 @@ try {
 
     normalized.isAcked = isAckedFinal;
     normalized._ackReason =
-      apiAcked ? 'api-acked' : (ack.ok === true ? (ack.reason || 'ack-ok') : (cachedAcked ? 'cached-acked' : null));
+      apiAcked
+        ? 'api-acked'
+        : (ack.ok === true ? (ack.reason || 'ack-ok') : (cachedAcked ? 'cached-acked' : null));
 
     let entitled = false;
     if (ENTITLE_WHILE_NOT_EXPIRED) {
@@ -1771,42 +1722,15 @@ try {
 
     const combined = combineWithCodeEntitlement({ storeEntitled: entitled, codeEnt });
 
-    console.log('[IAP][GOOGLE] verify', {
-      ms: Date.now() - startedAt,
-      userId: userId || null,
-      packageName: pkg,
-      productId: productId || null,
-      used,
-      api: normalized.api,
-      acknowledgementState: normalized.acknowledgementState || null,
-      willRenew: normalized.willRenew,
-      expiresAt: normalized.expiresAtISO || null,
-      notExpired,
-      isAcked: isAckedFinal,
-      entitled_iap: entitled,
-      entitled_code: !!codeEnt.pro,
-      finalEntitled: combined.finalEntitled,
-      gracePeriodHours: GRACE_PERIOD_HOURS,
-      ackOnVerify: ACK_ON_VERIFY,
-      ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
-      ackTried: ack.tried,
-      ackOk: ack.ok,
-      ackReason: ack.reason || null,
-      ackError: ack.error || null,
-    });
-
-        logAccessEvent('[ACCESS][GOOGLE][RESULT]', {
+    logSummary({
       userId: userId || null,
       platform: 'android',
-      packageName: pkg || null,
+      source: combined.source || 'free',
+      pro: combined.finalEntitled,
+      expiresAt: normalized.expiresAtISO || null,
+      codeAccessUntil: combined.codeAccessUntil || null,
       productId: productId || null,
       route: '/iap/google/subscription/verify',
-      source: combined.source,
-      entitled_iap: !!entitled,
-      entitled_code: !!codeEnt.pro,
-      finalEntitled: combined.finalEntitled,
-      codeAccessUntil: combined.codeAccessUntil,
-      isProbe: false,
     });
 
     return res.json({
@@ -1856,31 +1780,15 @@ try {
         const gr = await tryGraceEntitlement({ userId });
         const combined = combineWithCodeEntitlement({ storeEntitled: !!gr.ok, codeEnt });
 
-        console.warn('[IAP][GRACE][GOOGLE] applied?', {
-          userId: userId || null,
-          ok: gr.ok,
-          reason: gr.reason,
-          cachedExpiresAt: gr.cached?.expiresAtISO || null,
-          cachedLastOkAt: gr.cached?.lastOkAtISO || null,
-          entitled_code: !!codeEnt.pro,
-          finalEntitled: combined.finalEntitled,
-        });
-
-                logAccessEvent('[ACCESS][GOOGLE][GRACE]', {
+        logSummary({
           userId: userId || null,
           platform: 'android',
-          packageName: pkg || null,
-          productId: productId || null,
-          route: '/iap/google/subscription/verify',
-          source: gr.ok ? 'grace_cache' : (codeEnt.pro ? 'partner_code' : null),
-          entitled_iap: !!gr.ok,
-          entitled_code: !!codeEnt.pro,
-          finalEntitled: combined.finalEntitled,
+          source: gr.ok ? 'grace' : (codeEnt.pro ? 'code' : 'free'),
+          pro: combined.finalEntitled,
+          expiresAt: gr.cached?.expiresAtISO || null,
           codeAccessUntil: codeEnt.accessUntil || null,
-          cachedExpiresAt: gr.cached?.expiresAtISO || null,
-          cachedNotExpired: gr.cached?.expiresAtISO ? isNotExpired(gr.cached.expiresAtISO) : false,
-          isProbe: false,
-          note: gr.reason || 'grace branch',
+          productId: productId || null,
+          route: '/iap/google/subscription/verify:grace',
         });
 
         if (combined.finalEntitled) {
@@ -1915,6 +1823,17 @@ try {
       }
     }
 
+    logSummary({
+      userId: userId || null,
+      platform: 'android',
+      source: codeEnt.pro ? 'code' : 'free',
+      pro: !!codeEnt.pro,
+      expiresAt: null,
+      codeAccessUntil: codeEnt.accessUntil || null,
+      productId: productId || null,
+      route: '/iap/google/subscription/verify:error',
+    });
+
     return res.status(status).json({
       ok: false,
       error: data || err?.message || 'Unknown error',
@@ -1924,19 +1843,12 @@ try {
   }
 });
 
-// -------------------- IAP Verify: Apple --------------------
+
 // -------------------- IAP Verify: Apple --------------------
 app.post('/iap/apple/subscription/verify', async (req, res) => {
   try {
     const { receipt, purchaseToken, userId, productId } = req.body || {};
     const effectiveReceipt = receipt || purchaseToken || '';
-
-    console.log('[IAP][APPLE][VERIFY][INPUT]', {
-      userId: userId || null,
-      productId: productId || null,
-      receipt_present: !!effectiveReceipt,
-      receipt_length: effectiveReceipt ? String(effectiveReceipt).length : 0,
-    });
 
     if (!effectiveReceipt) {
       return res.status(400).json({ ok: false, error: 'receipt_required' });
@@ -1955,29 +1867,23 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
       console.warn('[IAP][APPLE] code entitlement read failed (ignored):', e?.message || e);
     }
 
-    const started = Date.now();
     const appleResp = await verifyAppleReceiptWithFallback(effectiveReceipt);
 
-    console.log('[IAP][APPLE][STEP] after apple verify', {
-      userId,
-      productId,
-      hasResponse: !!appleResp,
-      hasJson: !!appleResp?.json,
-      status: appleResp?.json?.status,
-      env: appleResp?.env,
-    });
-
-    const makeGraceResponse = ({
-      gr,
-      codeEnt,
-      userId,
-      productId,
-      env = null,
-      appleStatus = null,
-    }) => {
+    const makeGraceResponse = ({ gr, codeEnt, userId, productId, env = null, appleStatus = null }) => {
       const combined = combineWithCodeEntitlement({
         storeEntitled: !!gr?.ok,
         codeEnt,
+      });
+
+      logSummary({
+        userId: userId || null,
+        platform: 'ios',
+        source: gr?.ok ? 'grace' : (codeEnt?.pro ? 'code' : 'free'),
+        pro: combined.finalEntitled,
+        expiresAt: gr?.cached?.expiresAtISO || null,
+        codeAccessUntil: codeEnt?.accessUntil || null,
+        productId: productId || null,
+        route: '/iap/apple/subscription/verify:grace',
       });
 
       return {
@@ -2015,7 +1921,19 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
 
     if (!appleResp?.json) {
       const emergency = await tryIosEmergencyGrace({ userId });
-      if (emergency?.ok) return res.json(emergency.response);
+      if (emergency?.ok) {
+        logSummary({
+          userId: userId || null,
+          platform: 'ios',
+          source: emergency.response?.source || 'grace',
+          pro: !!emergency.response?.pro,
+          expiresAt: emergency.response?.expiresAt || null,
+          codeAccessUntil: emergency.response?.codeAccessUntil || null,
+          productId: productId || null,
+          route: '/iap/apple/subscription/verify:emergency_grace',
+        });
+        return res.json(emergency.response);
+      }
 
       const grace = await tryGraceEntitlement({ userId });
       if (grace?.ok) {
@@ -2034,6 +1952,17 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
       const combined = combineWithCodeEntitlement({
         storeEntitled: false,
         codeEnt,
+      });
+
+      logSummary({
+        userId: userId || null,
+        platform: 'ios',
+        source: combined.source || 'free',
+        pro: combined.finalEntitled,
+        expiresAt: null,
+        codeAccessUntil: combined.codeAccessUntil || null,
+        productId: productId || null,
+        route: '/iap/apple/subscription/verify:invalid_json',
       });
 
       return res.status(502).json({
@@ -2063,7 +1992,19 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
 
     if (appleResp.json.status !== 0) {
       const emergency = await tryIosEmergencyGrace({ userId });
-      if (emergency?.ok) return res.json(emergency.response);
+      if (emergency?.ok) {
+        logSummary({
+          userId: userId || null,
+          platform: 'ios',
+          source: emergency.response?.source || 'grace',
+          pro: !!emergency.response?.pro,
+          expiresAt: emergency.response?.expiresAt || null,
+          codeAccessUntil: emergency.response?.codeAccessUntil || null,
+          productId: productId || null,
+          route: '/iap/apple/subscription/verify:emergency_grace',
+        });
+        return res.json(emergency.response);
+      }
 
       const grace = await tryGraceEntitlement({ userId });
       if (grace?.ok) {
@@ -2082,6 +2023,17 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
       const combined = combineWithCodeEntitlement({
         storeEntitled: false,
         codeEnt,
+      });
+
+      logSummary({
+        userId: userId || null,
+        platform: 'ios',
+        source: combined.source || 'free',
+        pro: combined.finalEntitled,
+        expiresAt: null,
+        codeAccessUntil: combined.codeAccessUntil || null,
+        productId: productId || null,
+        route: '/iap/apple/subscription/verify:apple_status',
       });
 
       return res.json({
@@ -2110,17 +2062,21 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
 
     const latest = pickLatestAppleSubscriptionItem(appleResp.json, productId);
 
-    console.log('[IAP][APPLE][STEP] latest item', {
-      userId,
-      productId,
-      hasLatest: !!latest,
-      latestProduct: latest?.product_id,
-      expires: latest?.expires_date_ms,
-    });
-
     if (!latest) {
       const emergency = await tryIosEmergencyGrace({ userId });
-      if (emergency?.ok) return res.json(emergency.response);
+      if (emergency?.ok) {
+        logSummary({
+          userId: userId || null,
+          platform: 'ios',
+          source: emergency.response?.source || 'grace',
+          pro: !!emergency.response?.pro,
+          expiresAt: emergency.response?.expiresAt || null,
+          codeAccessUntil: emergency.response?.codeAccessUntil || null,
+          productId: productId || null,
+          route: '/iap/apple/subscription/verify:emergency_grace',
+        });
+        return res.json(emergency.response);
+      }
 
       const grace = await tryGraceEntitlement({ userId });
       if (grace?.ok) {
@@ -2139,6 +2095,17 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
       const combined = combineWithCodeEntitlement({
         storeEntitled: false,
         codeEnt,
+      });
+
+      logSummary({
+        userId: userId || null,
+        platform: 'ios',
+        source: combined.source || 'free',
+        pro: combined.finalEntitled,
+        expiresAt: null,
+        codeAccessUntil: combined.codeAccessUntil || null,
+        productId: productId || null,
+        route: '/iap/apple/subscription/verify:no_latest',
       });
 
       return res.json({
@@ -2217,19 +2184,15 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
       console.warn('[IAP][GRACE][APPLE] cache write failed (ignored):', e?.message || e);
     }
 
-    console.log('[IAP][APPLE] verify', {
-      ms: Date.now() - started,
+    logSummary({
       userId: userId || null,
+      platform: 'ios',
+      source: combined.source || 'free',
+      pro: combined.finalEntitled,
+      expiresAt: expiresAt || null,
+      codeAccessUntil: combined.codeAccessUntil || null,
       productId: latest?.product_id || productId || null,
-      env: appleResp.env || null,
-      expiresAt,
-      notExpired,
-      willRenew,
-      cancellationDate,
-      entitled_iap: storeEntitled,
-      entitled_code: !!codeEnt.pro,
-      finalEntitled: combined.finalEntitled,
-      iosEmergencyGrace: IOS_EMERGENCY_GRACE,
+      route: '/iap/apple/subscription/verify',
     });
 
     return res.json({
@@ -2272,13 +2235,36 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
     } catch {}
 
     const emergency = await tryIosEmergencyGrace({ userId: bodyUserId });
-    if (emergency?.ok) return res.json(emergency.response);
+    if (emergency?.ok) {
+      logSummary({
+        userId: bodyUserId || null,
+        platform: 'ios',
+        source: emergency.response?.source || 'grace',
+        pro: !!emergency.response?.pro,
+        expiresAt: emergency.response?.expiresAt || null,
+        codeAccessUntil: emergency.response?.codeAccessUntil || null,
+        productId: req?.body?.productId || null,
+        route: '/iap/apple/subscription/verify:emergency_grace',
+      });
+      return res.json(emergency.response);
+    }
 
     const grace = await tryGraceEntitlement({ userId: bodyUserId });
     if (grace?.ok) {
       const combined = combineWithCodeEntitlement({
         storeEntitled: true,
         codeEnt,
+      });
+
+      logSummary({
+        userId: bodyUserId || null,
+        platform: 'ios',
+        source: 'grace',
+        pro: combined.finalEntitled,
+        expiresAt: grace?.cached?.expiresAtISO || null,
+        codeAccessUntil: codeEnt?.accessUntil || null,
+        productId: req?.body?.productId || null,
+        route: '/iap/apple/subscription/verify:fatal_grace',
       });
 
       return res.json({
@@ -2309,6 +2295,17 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
         },
       });
     }
+
+    logSummary({
+      userId: bodyUserId || null,
+      platform: 'ios',
+      source: codeEnt.pro ? 'code' : 'free',
+      pro: !!codeEnt.pro,
+      expiresAt: null,
+      codeAccessUntil: codeEnt.accessUntil || null,
+      productId: req?.body?.productId || null,
+      route: '/iap/apple/subscription/verify:error',
+    });
 
     return res.status(500).json({
       ok: false,
