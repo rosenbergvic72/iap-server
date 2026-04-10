@@ -172,15 +172,17 @@ function logSummary(payload = {}) {
   console.log('[ACCESS][SUMMARY]', {
     userId: payload.userId || null,
     platform: payload.platform || null,
-    source: payload.source || null,              // ping / iap / partner_code / grace / free
+    source: payload.source || null,
     route: payload.route || null,
+
+    accessStage: payload.accessStage || null,
 
     pro: typeof payload.pro === 'boolean' ? payload.pro : null,
     entitled: typeof payload.entitled === 'boolean' ? payload.entitled : null,
     finalEntitled:
       typeof payload.finalEntitled === 'boolean' ? payload.finalEntitled : null,
 
-    reason: payload.reason || null,              // ping_only / cached_store_active / code_only / store_active / verify_error ...
+    reason: payload.reason || null,
     productId: payload.productId || null,
     packageName: payload.packageName || null,
 
@@ -1071,6 +1073,8 @@ app.post('/access/ping', async (req, res) => {
       source: combined.source || 'free',
       route: '/access/ping',
 
+       accessStage: 'ping_cache',
+
       pro: combined.finalEntitled,
       entitled: combined.finalEntitled,
       finalEntitled: combined.finalEntitled,
@@ -1581,16 +1585,41 @@ app.post('/redeem/code', async (req, res) => {
       return res.status(status).json({ ok: false, error: out.error });
     }
 
- logSummary({
-  userId: String(userId),
-  platform: 'codes',
-  source: 'code',
-  pro: true,
-  expiresAt: null,
-  codeAccessUntil: out.accessUntil,
-  productId: null,
-  route: '/redeem/code',
-});
+    logSummary({
+      userId: String(userId),
+      platform: 'codes',
+      source: 'partner_code',
+      route: '/redeem/code',
+
+      accessStage: 'code_redeem',
+
+      pro: true,
+      entitled: true,
+      finalEntitled: true,
+
+      reason: 'code_redeemed',
+
+      productId: null,
+      packageName: null,
+
+      expiresAt: null,
+      notExpired: null,
+
+      codeAccessUntil: out.accessUntil || null,
+
+      isAcked: null,
+      ackReason: null,
+
+      probe: false,
+      graceApplied: false,
+      graceReason: null,
+
+      cachedExpiresAt: null,
+      cachedLastOkAt: null,
+
+      storeEntitled: false,
+      codeEntitled: true,
+    });
 
     return res.json({
       ok: true,
@@ -1615,15 +1644,40 @@ app.get('/entitlements', async (req, res) => {
     if (!userId) return res.status(400).json({ ok: false, error: 'userId_required' });
 
     if (!CODE_PEPPER || !codesStore) {
-      logSummary({
+           logSummary({
         userId,
         platform: 'codes',
         source: 'free',
-        pro: false,
-        expiresAt: null,
-        codeAccessUntil: null,
-        productId: null,
         route: '/entitlements',
+
+        accessStage: 'code_check',
+
+        pro: false,
+        entitled: false,
+        finalEntitled: false,
+
+        reason: 'codes_disabled_or_store_missing',
+
+        productId: null,
+        packageName: null,
+
+        expiresAt: null,
+        notExpired: null,
+
+        codeAccessUntil: null,
+
+        isAcked: null,
+        ackReason: null,
+
+        probe: false,
+        graceApplied: false,
+        graceReason: null,
+
+        cachedExpiresAt: null,
+        cachedLastOkAt: null,
+
+        storeEntitled: false,
+        codeEntitled: false,
       });
 
       return res.json({
@@ -1637,15 +1691,40 @@ app.get('/entitlements', async (req, res) => {
 
     const ent = await codesStore.getEntitlement({ userId });
 
-    logSummary({
+     logSummary({
       userId,
       platform: 'codes',
-      source: ent.pro ? 'code' : 'free',
-      pro: !!ent.pro,
-      expiresAt: null,
-      codeAccessUntil: ent.accessUntil || null,
-      productId: null,
+      source: ent.pro ? 'partner_code' : 'free',
       route: '/entitlements',
+
+      accessStage: 'code_check',
+
+      pro: !!ent.pro,
+      entitled: !!ent.pro,
+      finalEntitled: !!ent.pro,
+
+      reason: ent.pro ? 'code_active' : 'code_inactive',
+
+      productId: null,
+      packageName: null,
+
+      expiresAt: null,
+      notExpired: null,
+
+      codeAccessUntil: ent.accessUntil || null,
+
+      isAcked: null,
+      ackReason: null,
+
+      probe: false,
+      graceApplied: false,
+      graceReason: null,
+
+      cachedExpiresAt: null,
+      cachedLastOkAt: null,
+
+      storeEntitled: false,
+      codeEntitled: !!ent.pro,
     });
 
     return res.json({
@@ -1695,11 +1774,38 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
         userId: userId || null,
         platform: 'android',
         source: combined.source || 'free',
-        pro: combined.finalEntitled,
-        expiresAt: cached?.expiresAtISO || null,
-        codeAccessUntil: combined.codeAccessUntil || null,
-        productId: productId || null,
         route: '/iap/google/subscription/verify:probe',
+
+        accessStage: 'probe',
+
+        pro: combined.finalEntitled,
+        entitled: combined.finalEntitled,
+        finalEntitled: combined.finalEntitled,
+
+        reason: combined.finalEntitled
+          ? (codeEnt.pro ? 'probe_code_only' : 'probe_cached_only')
+          : 'probe_only',
+
+        productId: productId || null,
+        packageName: pkg || null,
+
+        expiresAt: cached?.expiresAtISO || null,
+        notExpired: cached?.expiresAtISO ? isNotExpired(cached.expiresAtISO) : false,
+
+        codeAccessUntil: combined.codeAccessUntil || null,
+
+        isAcked: cached?.isAcked === true,
+        ackReason: cached?.isAcked === true ? 'cached-acked' : null,
+
+        probe: true,
+        graceApplied: false,
+        graceReason: null,
+
+        cachedExpiresAt: cached?.expiresAtISO || null,
+        cachedLastOkAt: cached?.lastOkAtISO || null,
+
+        storeEntitled: false,
+        codeEntitled: !!codeEnt.pro,
       });
 
       return res.json({
@@ -1833,11 +1939,40 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
       userId: userId || null,
       platform: 'android',
       source: combined.source || 'free',
-      pro: combined.finalEntitled,
-      expiresAt: normalized.expiresAtISO || null,
-      codeAccessUntil: combined.codeAccessUntil || null,
-      productId: productId || null,
       route: '/iap/google/subscription/verify',
+
+      accessStage: 'live_verify',
+
+      pro: combined.finalEntitled,
+      entitled: entitled,
+      finalEntitled: combined.finalEntitled,
+
+      reason: entitled
+        ? 'store_active'
+        : codeEnt.pro
+          ? 'code_only'
+          : 'store_inactive',
+
+      productId: productId || null,
+      packageName: pkg || null,
+
+      expiresAt: normalized.expiresAtISO || null,
+      notExpired,
+
+      codeAccessUntil: combined.codeAccessUntil || null,
+
+      isAcked: isAckedFinal,
+      ackReason: normalized._ackReason || ack.reason || null,
+
+      probe: false,
+      graceApplied: false,
+      graceReason: null,
+
+      cachedExpiresAt: cached?.expiresAtISO || null,
+      cachedLastOkAt: cached?.lastOkAtISO || null,
+
+      storeEntitled: entitled,
+      codeEntitled: !!codeEnt.pro,
     });
 
     return res.json({
@@ -1890,12 +2025,41 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
         logSummary({
           userId: userId || null,
           platform: 'android',
-          source: gr.ok ? 'grace' : (codeEnt.pro ? 'code' : 'free'),
-          pro: combined.finalEntitled,
-          expiresAt: gr.cached?.expiresAtISO || null,
-          codeAccessUntil: codeEnt.accessUntil || null,
-          productId: productId || null,
+          source: gr.ok ? 'grace' : (codeEnt.pro ? 'partner_code' : 'free'),
           route: '/iap/google/subscription/verify:grace',
+
+          accessStage: 'grace',
+
+          pro: combined.finalEntitled,
+          entitled: !!gr.ok,
+          finalEntitled: combined.finalEntitled,
+
+          reason: gr.ok
+            ? 'grace_cache'
+            : codeEnt.pro
+              ? 'code_only'
+              : 'verify_temp_error_no_access',
+
+          productId: productId || null,
+          packageName: pkg || null,
+
+          expiresAt: gr.cached?.expiresAtISO || null,
+          notExpired: gr.cached?.expiresAtISO ? isNotExpired(gr.cached.expiresAtISO) : null,
+
+          codeAccessUntil: codeEnt.accessUntil || null,
+
+          isAcked: gr.cached?.isAcked === true,
+          ackReason: gr.cached?.isAcked === true ? 'cached-acked' : null,
+
+          probe: false,
+          graceApplied: !!gr.ok,
+          graceReason: gr.reason || null,
+
+          cachedExpiresAt: gr.cached?.expiresAtISO || null,
+          cachedLastOkAt: gr.cached?.lastOkAtISO || null,
+
+          storeEntitled: !!gr.ok,
+          codeEntitled: !!codeEnt.pro,
         });
 
         if (combined.finalEntitled) {
@@ -1933,12 +2097,39 @@ app.post('/iap/google/subscription/verify', async (req, res) => {
     logSummary({
       userId: userId || null,
       platform: 'android',
-      source: codeEnt.pro ? 'code' : 'free',
-      pro: !!codeEnt.pro,
-      expiresAt: null,
-      codeAccessUntil: codeEnt.accessUntil || null,
-      productId: productId || null,
+      source: codeEnt.pro ? 'partner_code' : 'free',
       route: '/iap/google/subscription/verify:error',
+
+      accessStage: 'verify_error',
+
+      pro: !!codeEnt.pro,
+      entitled: false,
+      finalEntitled: !!codeEnt.pro,
+
+      reason: isTemp
+        ? 'verify_error_grace_possible'
+        : 'verify_error_hard',
+
+      productId: productId || null,
+      packageName: pkg || null,
+
+      expiresAt: null,
+      notExpired: null,
+
+      codeAccessUntil: codeEnt.accessUntil || null,
+
+      isAcked: null,
+      ackReason: null,
+
+      probe: false,
+      graceApplied: false,
+      graceReason: null,
+
+      cachedExpiresAt: null,
+      cachedLastOkAt: null,
+
+      storeEntitled: false,
+      codeEntitled: !!codeEnt.pro,
     });
 
     return res.status(status).json({
