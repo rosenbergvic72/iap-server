@@ -172,12 +172,39 @@ function logSummary(payload = {}) {
   console.log('[ACCESS][SUMMARY]', {
     userId: payload.userId || null,
     platform: payload.platform || null,
-    source: payload.source || null,
-    pro: typeof payload.pro === 'boolean' ? payload.pro : null,
-    expiresAt: payload.expiresAt || null,
-    codeAccessUntil: payload.codeAccessUntil || null,
-    productId: payload.productId || null,
+    source: payload.source || null,              // ping / iap / partner_code / grace / free
     route: payload.route || null,
+
+    pro: typeof payload.pro === 'boolean' ? payload.pro : null,
+    entitled: typeof payload.entitled === 'boolean' ? payload.entitled : null,
+    finalEntitled:
+      typeof payload.finalEntitled === 'boolean' ? payload.finalEntitled : null,
+
+    reason: payload.reason || null,              // ping_only / cached_store_active / code_only / store_active / verify_error ...
+    productId: payload.productId || null,
+    packageName: payload.packageName || null,
+
+    expiresAt: payload.expiresAt || null,
+    notExpired:
+      typeof payload.notExpired === 'boolean' ? payload.notExpired : null,
+
+    codeAccessUntil: payload.codeAccessUntil || null,
+
+    isAcked:
+      typeof payload.isAcked === 'boolean' ? payload.isAcked : null,
+    ackReason: payload.ackReason || null,
+
+    probe: payload.probe === true,
+    graceApplied: payload.graceApplied === true,
+    graceReason: payload.graceReason || null,
+
+    cachedExpiresAt: payload.cachedExpiresAt || null,
+    cachedLastOkAt: payload.cachedLastOkAt || null,
+
+    storeEntitled:
+      typeof payload.storeEntitled === 'boolean' ? payload.storeEntitled : null,
+    codeEntitled:
+      typeof payload.codeEntitled === 'boolean' ? payload.codeEntitled : null,
   });
 }
 
@@ -1008,30 +1035,87 @@ app.post('/access/ping', async (req, res) => {
   try {
     const { userId, platform } = req.body || {};
 
+    let codeEnt = { pro: false, accessUntil: null };
+    let cached = null;
+
+    try {
+      if (userId && CODE_PEPPER && codesStore) {
+        codeEnt = await codesStore.getEntitlement({ userId: String(userId) });
+      }
+    } catch (e) {
+      console.warn('[PING] code entitlement read failed (ignored):', e?.message || e);
+    }
+
+    try {
+      if (userId && iapCache) {
+        cached = await iapCache.get(String(userId));
+      }
+    } catch (e) {
+      console.warn('[PING] iap cache read failed (ignored):', e?.message || e);
+    }
+
+    const cachedNotExpired = cached?.expiresAtISO
+      ? isNotExpired(cached.expiresAtISO)
+      : false;
+
+    const storeEntitled = !!cachedNotExpired;
+
+    const combined = combineWithCodeEntitlement({
+      storeEntitled,
+      codeEnt,
+    });
+
     logSummary({
       userId: userId || null,
       platform: platform || null,
-      source: 'ping',
-      pro: null,
-      expiresAt: null,
-      codeAccessUntil: null,
-      productId: null,
+      source: combined.source || 'free',
       route: '/access/ping',
+
+      pro: combined.finalEntitled,
+      entitled: combined.finalEntitled,
+      finalEntitled: combined.finalEntitled,
+
+      reason: storeEntitled
+        ? 'cached_store_active'
+        : codeEnt.pro
+          ? 'code_only'
+          : 'ping_only',
+
+      productId: cached?.productId || null,
+      packageName: cached?.packageName || null,
+
+      expiresAt: cached?.expiresAtISO || null,
+      notExpired: cachedNotExpired,
+
+      codeAccessUntil: combined.codeAccessUntil || null,
+
+      isAcked: cached?.isAcked === true,
+      ackReason: cached?.isAcked === true ? 'cached-acked' : null,
+
+      probe: false,
+      graceApplied: false,
+      graceReason: null,
+
+      cachedExpiresAt: cached?.expiresAtISO || null,
+      cachedLastOkAt: cached?.lastOkAtISO || null,
+
+      storeEntitled,
+      codeEntitled: !!codeEnt.pro,
     });
 
-    return res.json({ ok: true });
+    return res.json({
+      ok: true,
+      pro: combined.finalEntitled,
+      entitled: combined.finalEntitled,
+      source: combined.source || null,
+      cachedExpiresAt: cached?.expiresAtISO || null,
+      cachedLastOkAt: cached?.lastOkAtISO || null,
+      codeAccessUntil: combined.codeAccessUntil || null,
+    });
   } catch (e) {
     console.error('[PING] error:', e);
     return res.status(500).json({ ok: false });
   }
-});
-
-app.get('/version', (req, res) => {
-  res.json({
-    version: 'apple-receipt-centric-v1',
-    secretConfigured: !!process.env.APPLE_SHARED_SECRET,
-    time: new Date().toISOString(),
-  });
 });
 
 // -------------------- Mini Admin UI (browser) --------------------
