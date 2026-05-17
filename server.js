@@ -5,6 +5,7 @@
 // + Grace-period cache (do not drop Pro on temporary failures)
 //
 // Routes:
+//   POST /trial/start                      start/check internal app trial
 //   GET  /                                 health
 //   POST /iap/google/subscription/verify   verify Google Play subscription (v2->v1 fallback)
 //   POST /iap/apple/subscription/verify    verify Apple auto-renewable subscription (receipt verify)
@@ -94,6 +95,8 @@ const CODE_PEPPER = process.env.CODE_PEPPER || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 const IOS_EMERGENCY_GRACE = String(process.env.IOS_EMERGENCY_GRACE ?? '0') === '1';
+
+const INTERNAL_TRIAL_DAYS = Number(process.env.INTERNAL_TRIAL_DAYS || 3);
 
 // -------------------- CORS --------------------
 app.use((req, res, next) => {
@@ -1008,13 +1011,39 @@ async function tryIosEmergencyGrace({ userId }) {
   };
 }
 
+async function initInternalTrialsStore() {
+  if (!pgPool) {
+    console.warn('[TRIAL] Postgres not available; internal trial protection disabled');
+    return;
+  }
+
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS internal_trials (
+      user_id TEXT PRIMARY KEY,
+      started_at TIMESTAMPTZ NOT NULL,
+      ends_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  await pgPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_internal_trials_ends
+    ON internal_trials(ends_at);
+  `);
+
+  console.log('[TRIAL] Internal trials store: Postgres');
+}
+
 // -------------------- Health --------------------
 app.get('/', (req, res) => {
   res.json({
-    ok: true,
+        ok: true,
     service: 'iap+codes+grace',
     package: PACKAGE_NAME || null,
     cors: ALLOWED_ORIGIN || '*',
+
+    internalTrialDays: INTERNAL_TRIAL_DAYS,
+    internalTrialStore: pgPool ? 'postgres' : null,
 
     ackOnVerify: ACK_ON_VERIFY,
     ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
@@ -1031,6 +1060,127 @@ app.get('/', (req, res) => {
     adminEnabled: !!ADMIN_KEY,
   });
 });
+
+// -------------------- endpoint trial --------------------
+
+app.post('/trial/start', async (req, res) => {
+  try {
+    if (!requireApiKeyIfSet(req, res)) return;
+
+    if (!pgPool) {
+      return res.status(503).json({
+        ok: false,
+        error: 'trial_store_not_ready',
+      });
+    }
+
+    const { userId } = req.body || {};
+    const uid = String(userId || '').trim();
+
+    if (!uid) {
+      return res.status(400).json({
+        ok: false,
+        error: 'userId_required',
+      });
+    }
+
+    const existing = await pgPool.query(
+      `
+      SELECT user_id, started_at, ends_at
+      FROM internal_trials
+      WHERE user_id = $1
+      LIMIT 1
+      `,
+      [uid]
+    );
+
+    if (existing.rowCount > 0) {
+      const row = existing.rows[0];
+      const startedAt = new Date(row.started_at).toISOString();
+      const endsAt = new Date(row.ends_at).toISOString();
+      const active = Date.parse(endsAt) > Date.now();
+
+      logSummary({
+        userId: uid,
+        platform: 'internal_trial',
+        source: active ? 'internal_trial' : 'free',
+        route: '/trial/start',
+        accessStage: 'trial_existing',
+        pro: active,
+        entitled: active,
+        finalEntitled: active,
+        reason: active ? 'trial_active_existing' : 'trial_already_used',
+        expiresAt: endsAt,
+        notExpired: active,
+        storeEntitled: false,
+        codeEntitled: false,
+      });
+
+      return res.json({
+        ok: true,
+        alreadyUsed: true,
+        active,
+        source: 'internal_trial',
+        startedAt,
+        endsAt,
+      });
+    }
+
+    const startedAtDate = new Date();
+
+    const endDate = new Date(startedAtDate);
+    endDate.setDate(endDate.getDate() + INTERNAL_TRIAL_DAYS);
+    endDate.setHours(23, 59, 59, 999);
+
+    const inserted = await pgPool.query(
+      `
+      INSERT INTO internal_trials
+        (user_id, started_at, ends_at)
+      VALUES
+        ($1, $2, $3)
+      RETURNING user_id, started_at, ends_at
+      `,
+      [uid, startedAtDate.toISOString(), endDate.toISOString()]
+    );
+
+    const row = inserted.rows[0];
+
+    const startedAt = new Date(row.started_at).toISOString();
+    const endsAt = new Date(row.ends_at).toISOString();
+
+    logSummary({
+      userId: uid,
+      platform: 'internal_trial',
+      source: 'internal_trial',
+      route: '/trial/start',
+      accessStage: 'trial_created',
+      pro: true,
+      entitled: true,
+      finalEntitled: true,
+      reason: 'trial_started',
+      expiresAt: endsAt,
+      notExpired: true,
+      storeEntitled: false,
+      codeEntitled: false,
+    });
+
+    return res.json({
+      ok: true,
+      alreadyUsed: false,
+      active: true,
+      source: 'internal_trial',
+      startedAt,
+      endsAt,
+    });
+  } catch (e) {
+    console.error('[TRIAL] start error:', e);
+    return res.status(500).json({
+      ok: false,
+      error: 'internal_error',
+    });
+  }
+});
+
 
 // -------------------- Access Ping --------------------
 app.post('/access/ping', async (req, res) => {
@@ -2619,6 +2769,7 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
     await initCodesStore();
     await seedTestCodesIfNeeded();
     await initIapCache();
+    await initInternalTrialsStore();
   } catch (e) {
     console.error('[INIT] failed:', e?.message || e);
   }
