@@ -1129,7 +1129,7 @@ app.post('/trial/start', async (req, res) => {
     const startedAtDate = new Date();
 
     const endDate = new Date(startedAtDate);
-    endDate.setDate(endDate.getDate() + INTERNAL_TRIAL_DAYS);
+    endDate.setDate(endDate.getDate() + (INTERNAL_TRIAL_DAYS - 1));
     endDate.setHours(23, 59, 59, 999);
 
     const inserted = await pgPool.query(
