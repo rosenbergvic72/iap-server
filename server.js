@@ -97,6 +97,8 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const IOS_EMERGENCY_GRACE = String(process.env.IOS_EMERGENCY_GRACE ?? '0') === '1';
 
 const INTERNAL_TRIAL_DAYS = Number(process.env.INTERNAL_TRIAL_DAYS || 3);
+// Use a fixed secret across deployments; changing it invalidates device bindings.
+const TRIAL_DEVICE_PEPPER = process.env.TRIAL_DEVICE_PEPPER || CODE_PEPPER;
 
 // -------------------- CORS --------------------
 app.use((req, res, next) => {
@@ -1013,10 +1015,9 @@ async function tryIosEmergencyGrace({ userId }) {
 
 async function initInternalTrialsStore() {
   if (!pgPool) {
-    console.warn('[TRIAL] Postgres not available; internal trial protection disabled');
+    console.warn('[TRIAL] Postgres unavailable; new trial activation disabled');
     return;
   }
-
   await pgPool.query(`
     CREATE TABLE IF NOT EXISTS internal_trials (
       user_id TEXT PRIMARY KEY,
@@ -1025,13 +1026,42 @@ async function initInternalTrialsStore() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Safe migration: preserve existing rows and dates; bind their device on next use.
+  await pgPool.query(`ALTER TABLE internal_trials ADD COLUMN IF NOT EXISTS device_hash TEXT`);
+  await pgPool.query(`ALTER TABLE internal_trials ADD COLUMN IF NOT EXISTS platform TEXT`);
+  await pgPool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_internal_trials_device_hash
+    ON internal_trials(device_hash) WHERE device_hash IS NOT NULL`);
+  await pgPool.query(`CREATE INDEX IF NOT EXISTS idx_internal_trials_ends
+    ON internal_trials(ends_at)`);
+  console.log('[TRIAL] Internal trials store ready (device binding v2)');
+}
 
-  await pgPool.query(`
-    CREATE INDEX IF NOT EXISTS idx_internal_trials_ends
-    ON internal_trials(ends_at);
-  `);
+function trialEndOfLocalDay(started, offsetMinutes) {
+  // Day of installation + 3 full local calendar days (using the supplied UTC offset).
+  // Daylight-saving transitions can move the actual deadline by about one hour.
+  const offset = Number.isInteger(offsetMinutes) && offsetMinutes >= -840 && offsetMinutes <= 840
+    ? offsetMinutes : 0;
+  const local = new Date(started.getTime() - offset * 60000);
+  local.setUTCDate(local.getUTCDate() + INTERNAL_TRIAL_DAYS);
+  local.setUTCHours(23, 59, 59, 999);
+  return new Date(local.getTime() + offset * 60000);
+}
 
-  console.log('[TRIAL] Internal trials store: Postgres');
+function validatedLegacyTrial(input) {
+  if (!input || input.source !== 'local') return null;
+  const start = Number(input.startedAt);
+  const end = Number(input.endsAt);
+  const now = Date.now();
+  const maxDurationMs = 4 * 86400000 + 2 * 3600000;
+  if (!Number.isFinite(start) || !Number.isFinite(end) ||
+      start <= 0 || start > now + 5 * 60000 || end <= start ||
+      end - start > maxDurationMs) return null;
+  return { startedAt: new Date(start), endsAt: new Date(end) };
+}
+
+function hashTrialDevice(platform, deviceId) {
+  return crypto.createHmac('sha256', TRIAL_DEVICE_PEPPER)
+    .update(`verbify-trial-v2:${platform}:${deviceId}`).digest('hex');
 }
 
 // -------------------- Health --------------------
@@ -1043,7 +1073,7 @@ app.get('/', (req, res) => {
     cors: ALLOWED_ORIGIN || '*',
 
     internalTrialDays: INTERNAL_TRIAL_DAYS,
-    internalTrialStore: pgPool ? 'postgres' : null,
+    internalTrialStore: pgPool && TRIAL_DEVICE_PEPPER ? 'postgres' : null,
 
     ackOnVerify: ACK_ON_VERIFY,
     ackOnlyIfActive: ACK_ONLY_IF_ACTIVE,
@@ -1064,120 +1094,110 @@ app.get('/', (req, res) => {
 // -------------------- endpoint trial --------------------
 
 app.post('/trial/start', async (req, res) => {
+  if (!requireApiKeyIfSet(req, res)) return;
+  if (!pgPool || !TRIAL_DEVICE_PEPPER) {
+    return res.status(503).json({ ok: false, error: 'trial_store_not_ready' });
+  }
+
+  const { userId, deviceId, platform, legacyTrial, utcOffsetMinutes } = req.body || {};
+  const uid = String(userId || '').trim();
+  const id = String(deviceId || '').trim();
+  const os = String(platform || '').trim().toLowerCase();
+  if (!uid || uid.length > 160) return res.status(400).json({ ok: false, error: 'invalid_userId' });
+  if (!['ios', 'android'].includes(os) || id.length < 12 || id.length > 160 ||
+      !id.startsWith(`${os}:`) || !/^[a-zA-Z0-9:_-]+$/.test(id)) {
+    return res.status(400).json({ ok: false, error: 'invalid_deviceId' });
+  }
+
+  const deviceHash = hashTrialDevice(os, id);
+  let client = null;
   try {
-    if (!requireApiKeyIfSet(req, res)) return;
+    client = await pgPool.connect();
+    await client.query('BEGIN');
+    // Serialize concurrent first launches for this device and user.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`device:${deviceHash}`]);
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`user:${uid}`]);
 
-    if (!pgPool) {
-      return res.status(503).json({
-        ok: false,
-        error: 'trial_store_not_ready',
-      });
+    let row = (await client.query(
+      `SELECT user_id, started_at, ends_at, device_hash FROM internal_trials WHERE device_hash=$1 LIMIT 1`,
+      [deviceHash]
+    )).rows[0];
+    let reason = 'trial_existing_device';
+    let created = false;
+    let migrated = false;
+
+    if (!row) {
+      row = (await client.query(
+        `SELECT user_id, started_at, ends_at, device_hash FROM internal_trials WHERE user_id=$1 LIMIT 1`,
+        [uid]
+      )).rows[0];
+      if (row) {
+        reason = 'trial_existing_user';
+        if (!row.device_hash) {
+          // Old server record: preserve its original dates and attach device hash.
+          const updated = await client.query(
+            `UPDATE internal_trials SET device_hash=$1, platform=$2
+             WHERE user_id=$3 AND device_hash IS NULL
+             RETURNING user_id, started_at, ends_at, device_hash`,
+            [deviceHash, os, uid]
+          );
+          row = updated.rows[0] || row;
+          migrated = true;
+          reason = 'trial_existing_user_migrated';
+        }
+      }
     }
 
-    const { userId } = req.body || {};
-    const uid = String(userId || '').trim();
-
-    if (!uid) {
-      return res.status(400).json({
-        ok: false,
-        error: 'userId_required',
-      });
+    if (!row) {
+      const oldLocal = validatedLegacyTrial(legacyTrial);
+      const started = oldLocal?.startedAt || new Date();
+      const ends = oldLocal?.endsAt || trialEndOfLocalDay(started, Number(utcOffsetMinutes));
+      // A valid old local trial must keep its original date, even when expired.
+      migrated = !!oldLocal;
+      reason = migrated ? 'trial_local_migrated' : 'trial_created';
+      const inserted = await client.query(
+        `INSERT INTO internal_trials(user_id, device_hash, platform, started_at, ends_at)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT DO NOTHING
+         RETURNING user_id, started_at, ends_at, device_hash`,
+        [uid, deviceHash, os, started.toISOString(), ends.toISOString()]
+      );
+      row = inserted.rows[0];
+      created = !!row && !migrated;
+      if (!row) {
+        // May happen during a concurrent request or a conflicting restored userId.
+        row = (await client.query(
+          `SELECT user_id, started_at, ends_at, device_hash FROM internal_trials
+           WHERE device_hash=$1 OR user_id=$2 ORDER BY (device_hash=$1) DESC LIMIT 1`,
+          [deviceHash, uid]
+        )).rows[0];
+        if (!row) throw new Error('trial_record_conflict');
+        migrated = false;
+        reason = 'trial_existing_conflict';
+      }
     }
 
-    const existing = await pgPool.query(
-      `
-      SELECT user_id, started_at, ends_at
-      FROM internal_trials
-      WHERE user_id = $1
-      LIMIT 1
-      `,
-      [uid]
-    );
-
-    if (existing.rowCount > 0) {
-      const row = existing.rows[0];
-      const startedAt = new Date(row.started_at).toISOString();
-      const endsAt = new Date(row.ends_at).toISOString();
-      const active = Date.parse(endsAt) > Date.now();
-
-      logSummary({
-        userId: uid,
-        platform: 'internal_trial',
-        source: active ? 'internal_trial' : 'free',
-        route: '/trial/start',
-        accessStage: 'trial_existing',
-        pro: active,
-        entitled: active,
-        finalEntitled: active,
-        reason: active ? 'trial_active_existing' : 'trial_already_used',
-        expiresAt: endsAt,
-        notExpired: active,
-        storeEntitled: false,
-        codeEntitled: false,
-      });
-
-      return res.json({
-        ok: true,
-        alreadyUsed: true,
-        active,
-        source: 'internal_trial',
-        startedAt,
-        endsAt,
-      });
-    }
-
-    const startedAtDate = new Date();
-
-    const endDate = new Date(startedAtDate);
-    endDate.setDate(endDate.getDate() + INTERNAL_TRIAL_DAYS);
-    endDate.setHours(23, 59, 59, 999);
-
-    const inserted = await pgPool.query(
-      `
-      INSERT INTO internal_trials
-        (user_id, started_at, ends_at)
-      VALUES
-        ($1, $2, $3)
-      RETURNING user_id, started_at, ends_at
-      `,
-      [uid, startedAtDate.toISOString(), endDate.toISOString()]
-    );
-
-    const row = inserted.rows[0];
-
+    await client.query('COMMIT');
     const startedAt = new Date(row.started_at).toISOString();
     const endsAt = new Date(row.ends_at).toISOString();
-
+    const active = Date.parse(endsAt) > Date.now();
     logSummary({
-      userId: uid,
-      platform: 'internal_trial',
-      source: 'internal_trial',
-      route: '/trial/start',
-      accessStage: 'trial_created',
-      pro: true,
-      entitled: true,
-      finalEntitled: true,
-      reason: 'trial_started',
-      expiresAt: endsAt,
-      notExpired: true,
-      storeEntitled: false,
-      codeEntitled: false,
+      userId: uid, platform: os, source: active ? 'internal_trial' : 'free',
+      route: '/trial/start', accessStage: reason,
+      pro: active, entitled: active, finalEntitled: active,
+      reason, expiresAt: endsAt, notExpired: active,
+      storeEntitled: false, codeEntitled: false,
     });
-
     return res.json({
-      ok: true,
-      alreadyUsed: false,
-      active: true,
-      source: 'internal_trial',
-      startedAt,
-      endsAt,
+      ok: true, active, alreadyUsed: !created, migrated,
+      source: 'internal_trial', startedAt, endsAt,
     });
   } catch (e) {
-    console.error('[TRIAL] start error:', e);
-    return res.status(500).json({
-      ok: false,
-      error: 'internal_error',
-    });
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    console.error('[TRIAL] start error:', e?.message || e);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -2792,6 +2812,7 @@ app.post('/iap/apple/subscription/verify', async (req, res) => {
     console.log('      GRACE_PERIOD_HOURS:', GRACE_PERIOD_HOURS);
     console.log('      Grace cache:', iapCache?.kind || '(not ready)');
 
+    console.log('      Trial device pepper:', TRIAL_DEVICE_PEPPER ? 'set' : 'NOT SET');
     console.log('      Codes enabled:', CODE_PEPPER ? 'yes' : 'no');
     if (CODE_PEPPER) console.log('      Codes store:', codesStore?.kind || 'unknown');
     console.log('      Admin enabled:', ADMIN_KEY ? 'yes' : 'no');
